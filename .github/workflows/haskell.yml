@@ -29,10 +29,10 @@ jobs:
           ${{ runner.os }}-build-${{ env.cache-name }}-
           ${{ runner.os }}-build-
           ${{ runner.os }}-
-
+    - name: Install clblas and opencl
+      run: sudo apt-get install -y libclblas-dev opencl-headers ocl-icd-*
     - name: Install dependencies
       run: |
-        apt-get install -y libclblas-dev opencl-headers ocl-icd-*
         cabal update
         cabal build --only-dependencies --enable-tests --enable-benchmarks
     - name: Build
