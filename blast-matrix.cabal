@@ -1,0 +1,85 @@
+name:                blast-matrix
+version:             0.1.0.0
+-- synopsis:
+-- description:
+homepage:            https://github.com/jmdurr/blast-matrix#readme
+license:             BSD3
+license-file:        LICENSE
+author:              Jonathan Durr
+maintainer:          jmdurr@gmail.com
+copyright:           2020 Jonathan Durr
+category:            Math
+build-type:          Simple
+extra-source-files:  README.md
+cabal-version:       >=1.10
+
+
+library
+  hs-source-dirs:      src
+  exposed-modules:     Data.Matrix.OpenCL,
+                       -- Data.Matrix.CLBlast,
+                       Data.Matrix.CLBlas,
+                       Data.BlasM,
+                       ML.NNet,
+                       ML.NNet.FullyConnectedSGD,
+                       ML.NNet.Relu,
+                       ML.NNet.LeakyRelu,
+                       -- ML.NNet.Gelu,
+                       ML.NNet.Reshape,
+                       ML.NNet.Sigmoid,
+                       ML.NNet.Init.RandomFun,
+                       ML.NNet.Tanh,
+                       ML.NNet.Dropout,
+                       ML.NNet.Convolve,
+                       ML.NNet.Deconvolve,
+                       ML.NNet.ClipGrad,
+                       ML.NNet.LayerBias,
+
+                       --ML.NNet.GradientMod.LearningRate,
+                       ML.NNet.GradientMod.RMSProp,
+                       ML.NNet.GradientMod.Momentum,
+                       ML.NNet.GradientMod.Adam,
+                       ML.NNet.GradientMod.Rate,
+                       ML.NNet.GradientMod.Demon,
+
+                       Data.Matrix.CLBlasM
+  build-depends:       base,
+                       mtl,
+                       vector,
+                       containers,
+                       bytestring,
+                       hashable,
+                       random,
+                       formatting,
+                       text,
+                       language-c-quote,
+                       mainland-pretty
+
+  default-language:    Haskell2010
+  extra-libraries:     OpenCL,
+                       clBLAS
+  
+test-suite spec
+  type: exitcode-stdio-1.0
+  hs-source-dirs: test
+  main-is: Spec.hs
+  other-modules: 
+                 Data.Matrix.OpenCLSpec,
+                 Data.Matrix.CLBlasMSpec,
+                 ML.NNet.FullyConnectedSGDSpec,
+                 ML.NNet.ReluSpec,
+                 ML.NNet.LeakyReluSpec,
+                 ML.NNetSpec
+  build-depends: hspec
+               , hspec-discover
+               , base
+               , blast-matrix
+               , random
+  default-language:    Haskell2010
+  extra-libraries:     OpenCL,
+                       clBLAS
+
+
+source-repository head
+  type:     git
+  location: https://github.com/githubuser/blast-matrix
