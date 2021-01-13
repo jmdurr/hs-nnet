@@ -2,7 +2,7 @@
 
 This will be renamed to hs-nnet eventually
 
-A library for building neural networks that utilizes OpenCL by default but has abstracted
+A haskell library for building neural networks that utilizes OpenCL by default but has abstracted
 the main operations to enable switching the backend as necessary.
 
 Tries to achieve some type safety for layer dimension matching
