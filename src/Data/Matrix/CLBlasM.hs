@@ -625,24 +625,6 @@ multC cls =
           } 
      |]
 
-{-
-[35, 40, 41, 45, 50
-,40, 40, 42, 46, 52
-,42, 46, 50, 55, 55
-,48, 52, 56, 58, 60
-,56, 60, 65, 70, 75
-]
-
-[35, 40, 41, 45, 50,  0,
- 40, 40, 42, 46, 52,  1,
- 42, 46, 50, 55, 55,  2,
- 48, 52, 56, 58, 60,  3,
- 56, 60, 65, 70, 75,  4,
-  5,  6,  7,  8,  9, 10]
-
-s1,p0
--}
-
 flipC cls =
   let typ = ctypes cls
    in [cfun|kernel void flipMx(int w, int h, int d, int flipx, int flipy, global const $ty:typ * input, global $ty:typ * output){

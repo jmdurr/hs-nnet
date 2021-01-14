@@ -1,0 +1,2 @@
+package blast-matrix
+    extra-include-dirs: include
