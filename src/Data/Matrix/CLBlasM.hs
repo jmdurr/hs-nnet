@@ -612,6 +612,8 @@ addLayerC cls =
           } 
      |]
 
+-- TODO Use a double4 or float4 to process 4 at a time
+-- TODO In convolution use local memory for filter and input?
 multC cls =
   let typ = ctypes cls
    in [cfun|kernel void multC(const global $ty:typ * mx1, const global $ty:typ * mx2, global $ty:typ * out){
