@@ -17,13 +17,15 @@ data Momentum = Momentum Double Double
 
 instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientMod m Momentum (Matrix mx w h d) (Matrix mx w h d) where
   modGradient (Momentum rate gain) Nothing grad = do
-    g <- scale grad rate
-    pure (g, g)
+    vo2 <- scale grad (1 - gain)
+    g <- scale vo2 rate
+    pure (g, vo2)
   modGradient (Momentum rate gain) (Just vo) grad = do
     vo1 <- scale vo gain
-    vo2 <- scale grad gain
+    vo2 <- scale grad (1 - gain)
     vo3 <- add vo1 vo2
-    pure (vo3, vo3)
+    vo4 <- scale vo3 rate
+    pure (vo4, vo3)
 
 instance (Monad m) => GradientMod m Momentum () () where
   modGradient _ _ _ = pure ((), ())
