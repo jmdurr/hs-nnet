@@ -8,3 +8,4 @@ spec.prof
 stack.yaml.lock
 !include/openclhs.h
 !include/clblashs.h
+dist-newstyle

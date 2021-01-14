@@ -70,6 +70,7 @@ test-suite spec
                  ML.NNet.ReluSpec,
                  ML.NNet.LeakyReluSpec,
                  ML.NNetSpec
+  build-tools: hspec-discover
   build-depends: hspec
                , hspec-discover
                , base
