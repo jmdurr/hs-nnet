@@ -1,2 +1,4 @@
+packages: blast-matrix.cabal
+
 package blast-matrix
     extra-include-dirs: include
