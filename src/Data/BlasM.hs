@@ -26,6 +26,15 @@ data Matrix mx w h d where
 instance (KnownNat w, KnownNat h, KnownNat d, Show mx) => Show (Matrix mx w h d) where
   show (Matrix mx) = "Matrix " <> show (natVal (undefined :: Proxy w), natVal (undefined :: Proxy h), natVal (undefined :: Proxy d)) <> " [" <> show mx <> "]"
 
+mxWidth :: forall mx w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Int
+mxWidth _ = fromIntegral $ natVal (Proxy :: Proxy w)
+
+mxHeight :: forall mx w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Int
+mxHeight _ = fromIntegral $ natVal (Proxy :: Proxy h)
+
+mxDepth :: forall mx w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Int
+mxDepth _ = fromIntegral $ natVal (Proxy :: Proxy d)
+
 type Vector mx n = Matrix mx 1 n 1
 
 data IfExp
