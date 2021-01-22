@@ -32,7 +32,7 @@ library
                        ML.NNet.Dropout,
                        ML.NNet.Convolve,
                        ML.NNet.Deconvolve,
-                       ML.NNet.ClipGrad,
+                       --ML.NNet.ClipGrad,
                        ML.NNet.LayerBias,
 
                        --ML.NNet.GradientMod.LearningRate,
@@ -41,6 +41,7 @@ library
                        ML.NNet.GradientMod.Adam,
                        ML.NNet.GradientMod.Rate,
                        ML.NNet.GradientMod.Demon,
+                       ML.NNet.GradientMod.ClipWeights,
 
                        Data.Matrix.CLBlasM
   build-depends:       base,
@@ -54,6 +55,7 @@ library
                        text,
                        language-c-quote,
                        mainland-pretty
+                       --iee754
 
   default-language:    Haskell2010
   extra-libraries:     OpenCL,

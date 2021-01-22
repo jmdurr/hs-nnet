@@ -69,6 +69,7 @@ class (Storable a, Floating a) => CLBlasType a where
   clblasTCopy :: Proxy a -> SizeT -> CLMem_ -> SizeT -> CInt -> CLMem_ -> SizeT -> CInt -> CLUInt -> Ptr CLCommandQueue_ -> CLUInt -> Ptr CLEvent_ -> Ptr CLEvent_ -> IO CLBlasStatusCode
   clblasTypeToDouble :: a -> Double
   clblasTypeCStringRep :: a -> String
+  clblasTypeNearZero :: Proxy a -> Double
 
 instance CLBlasType CDouble where
   clblasTgemm = clblasDgemm_
@@ -77,6 +78,8 @@ instance CLBlasType CDouble where
   clblasTCopy _ = clblasDcopy_
   clblasTypeToDouble = fromRational . toRational
   clblasTypeCStringRep _ = "double"
+  clblasTypeNearZero _ = encodeFloat (signif+1) expo - 1.0
+                      where (signif,expo) = decodeFloat (1.0::CDouble)
 
 instance CLBlasType CFloat where
   clblasTgemm = clblasSgemm_
@@ -85,7 +88,8 @@ instance CLBlasType CFloat where
   clblasTCopy _ = clblasScopy_
   clblasTypeToDouble = fromRational . toRational
   clblasTypeCStringRep _ = "float"
-
+  clblasTypeNearZero _ = encodeFloat (signif+1) expo - 1.0
+                      where (signif,expo) = decodeFloat (1.0::CFloat)
 
 
 failLeft :: (MonadFail m, MonadIO m) => IO (Either String a) -> m a

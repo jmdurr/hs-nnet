@@ -36,12 +36,10 @@ reluBackward _ oldIn mx = do
 reluAvg :: Monad m => [ReluG] -> m ReluG
 reluAvg _ = pure ReluG
 
-reluU :: (Monad m, GradientMod m igm mod ReluG) => ReluSt -> ReluG -> igm -> Maybe mod -> m (ReluSt, mod)
-reluU _ _ igm mod = do
-  (_, m') <- modGradient igm mod ReluG
-  pure (ReluSt, m')
+reluU :: (Monad m) => conf -> ReluSt -> ReluG -> m ReluSt
+reluU _ st _ = pure st
 
-relu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g, GradientMod m igm mod ReluG) => Proxy w -> Proxy h -> Proxy d -> Layer m mx ReluSt (ReluIn mx w h d) ReluG w h d w h d igm mod g
+relu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy w -> Proxy h -> Proxy d -> Layer m mx ReluSt (ReluIn mx w h d) ReluG w h d w h d conf mod g
 relu w h d = Layer reluForward reluBackward reluAvg reluU reluInit
 
 reluInit :: (RandomGen g, Monad m) => (g -> (Double, g)) -> g -> m (ReluSt, g)

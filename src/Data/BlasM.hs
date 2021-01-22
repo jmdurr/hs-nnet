@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
 {-# LANGUAGE ExplicitForAll #-}
@@ -12,13 +13,15 @@
 
 module Data.BlasM where
 
-import Control.Monad.IO.Class (MonadIO)
-import Data.Hashable
+import Control.Monad (foldM)
+import Control.Monad.IO.Class (MonadIO, liftIO)
 import Data.Proxy
 import Data.Word (Word64)
+import Debug.Trace
 import Foreign.Storable
 import GHC.Generics (Generic)
 import GHC.TypeLits
+import Text.Printf
 
 data Matrix mx w h d where
   Matrix :: (KnownNat w, KnownNat h, KnownNat d) => mx -> Matrix mx w h d
@@ -64,12 +67,9 @@ data MxFunction
   | If IfExp MxFunction MxFunction
   deriving (Show, Eq, Generic)
 
-instance Hashable MxFunction
-
-instance Hashable IfExp
-
 -- | A class for something that provides a blas like interface
 class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
+  nearZero :: m Double
   dot :: (KnownNat h) => Vector mx h -> Vector mx h -> m Double
 
   -- (h,w) x (w,w1) = (h,w1)
@@ -122,10 +122,12 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     (KnownNat w, KnownNat h, KnownNat d) =>
     Matrix mx w h d ->
     m [[[Double]]]
+
+  -- TODO flipping does not always equal the same w h d, need to split this into flipH flipV flipBoth
   flip :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> FlipAxis -> m (Matrix mx w h d)
 
   addToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
-
+  multToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
   sumFlatten :: forall w h d nd. (KnownNat w, KnownNat h, KnownNat d, KnownNat nd) => Matrix mx w h d -> Proxy nd -> m (Matrix mx w h nd)
 
   sumLayers :: forall w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m (Matrix mx 1 1 d)
@@ -275,11 +277,60 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
 -- TODO add a requirement that the filter center is always over the input matrix (not over the padding)
 data FlipAxis = FlipX | FlipY | FlipBoth deriving (Eq, Show)
 
-avgMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m (Matrix mx w h d)
-avgMxs [] = error "cannot average empty list"
-avgMxs (v : vs) = go v vs
+varMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m Double
+varMxs [] = error "cannot variance empty list"
+varMxs mxs =
+  let len = length mxs
+      numCells = mxWidth (head mxs) * mxHeight (head mxs) * mxDepth (head mxs)
+   in do
+        -- sum layers, divide by (# matrices
+        avg <- avgMxs mxs
+        v1 <- mapM (`applyFunction` (Exp (Sub Value (Const avg)) (Const 2.0))) mxs
+        top1 <- mapM sumLayers v1
+        top2 <- mapM mxToLists top1
+
+        let top = sum $ concat $ concat $ concat top2
+        pure (top / (fromIntegral $ numCells * len - 1))
+
+cellAvgMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m (Matrix mx w h d)
+cellAvgMxs [] = error "cannot average empty list"
+cellAvgMxs (v : vs) = go v vs
   where
-    go v' [] = applyFunction v' (Div Value (Const (fromIntegral $ length (v : vs))))
+    len = length (v : vs)
+    go v' [] = applyFunction v' (Div Value (Const (fromIntegral len)))
     go v' (vn : vs') = do
       nv <- add v' vn
       go nv vs'
+
+avgMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m Double
+avgMxs [] = error "Cannot average 0 matrices"
+avgMxs mxs = do
+  cavg <- cellAvgMxs mxs -- one matrix w h d
+  ls <- sumLayers cavg -- one matrix 1 1 d (divide by w*h to get average) -- mxToLists = [ [ [1] ],[ [ [2] ] ] ]
+  ttl <- (sum . concat . concat) <$> mxToLists ls
+  -- divide by total size
+  pure (ttl / (fromIntegral $ mxWidth (head mxs) * mxHeight (head mxs) * mxDepth (head mxs)))
+
+foldM' :: (Monad m) => (a -> b -> m a) -> a -> [b] -> m a
+foldM' _ z [] = return z
+foldM' f z (x : xs) = do
+  z' <- f z x
+  z' `seq` foldM' f z' xs
+
+normalizeMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, MonadFail m) => [Matrix mx w h d] -> m [Matrix mx w h d]
+normalizeMxs [] = fail "Cannot normalize 0 matrices"
+normalizeMxs mxs = do
+  -- find max and min value
+  (minVal, maxVal) <- foldM' (\(!mini, !maxi) mx -> ((concat . concat) <$> mxToLists mx) >>= \ls -> pure (min mini (minimum ls), max maxi (maximum ls))) (1 / 0, (-1 / 0)) mxs
+  foldM' (\mxs' mx -> applyFunction mx (Div (Sub Value (Const minVal)) (Sub (Const maxVal) (Const minVal))) >>= \mx' -> pure (mxs' ++ [mx'])) [] mxs
+
+normalizeZeroUnitMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, MonadFail m) => [Matrix mx w h d] -> m [Matrix mx w h d]
+normalizeZeroUnitMxs mxs = do
+  avg <- avgMxs mxs
+  var <- varMxs mxs
+  let sd = sqrt var
+  mapM (`applyFunction` (Div (Sub Value (Const avg)) (Const sd))) mxs
+
+clampMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Double -> Double -> m (Matrix mx w h d)
+clampMx mx clampMin clampMax =
+  applyFunction mx (Max (Const clampMin) (Min (Const clampMax) Value))

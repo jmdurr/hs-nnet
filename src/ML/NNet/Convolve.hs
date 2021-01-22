@@ -27,14 +27,14 @@ This results in a single feature map per filter or 1 output layer per filter
 
 -}
 
-type ConvolveSt mx fw fh fd id = Matrix mx fw fh (id GHC.TypeLits.* fd)
+data ConvolveSt mx fw fh fd id gst = ConvolveSt (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Maybe gst)
 
 type ConvolveIn mx iw ih id = Matrix mx iw ih id
 
 type ConvolveG mx fw fh fd id = Matrix mx fw fh (id GHC.TypeLits.* fd)
 
 conForward ::
-  forall m mx wi hi di fw fh fd wo ho pyt pyb pxl pxr sy sx.
+  forall m mx wi hi di fw fh fd wo ho pyt pyb pxl pxr sy sx gst.
   ( BlasM m mx,
     KnownNat wi,
     KnownNat hi,
@@ -62,10 +62,10 @@ conForward ::
   ) =>
   Proxy '(sx, sy) ->
   Proxy '(pxl, pxr, pyt, pyb) ->
-  ConvolveSt mx fw fh fd di ->
+  ConvolveSt mx fw fh fd di gst ->
   Matrix mx wi hi di ->
   m (Matrix mx wo ho fd, ConvolveIn mx wi hi di)
-conForward ps pp flt inmx = do
+conForward ps pp (ConvolveSt flt _) inmx = do
   -- inmx == di, filterd = fd
   r <- Data.BlasM.convolve inmx flt (Proxy :: Proxy fd) (Proxy :: Proxy sx, Proxy :: Proxy sy) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy 0, Proxy :: Proxy 0) False
   -- r' <- add r (cFilterBiases con) -- each filter layer has 1 bias so just need to add it to every output at each depth
@@ -76,7 +76,7 @@ conForward ps pp flt inmx = do
 -- TODO filter should multiply all weight depth * input depth as well and be run for each filter
 
 conBackward ::
-  forall m mx wi hi di fw fh sx sy pxl pxr pyt pyb wo ho fd.
+  forall m mx wi hi di fw fh sx sy pxl pxr pyt pyb wo ho fd gst.
   ( BlasM m mx,
     KnownNat wi,
     KnownNat hi,
@@ -118,44 +118,44 @@ conBackward ::
   ) =>
   Proxy '(sx, sy) ->
   Proxy '(pxl, pxr, pyt, pyb) ->
-  ConvolveSt mx fw fh fd di ->
+  ConvolveSt mx fw fh fd di gst ->
   ConvolveIn mx wi hi di ->
   Matrix mx wo ho fd ->
   m (Matrix mx wi hi di, ConvolveG mx fw fh fd di)
-conBackward ps pp wgt oldIn dy = do
+conBackward ps pp (ConvolveSt wgt _) oldIn dy = do
   -- dy is fd deep
   -- w is fd * id deep
   -- dx is id deep
-  ndy <- Data.BlasM.convolveLayersDy dy wgt (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0) True
+  dLdX <- Data.BlasM.convolveLayersDy dy wgt (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0) True
+  -- rotate kernel, convolve with dy, multiply y
   -- dy has same # of layers as x but we need to output x * fd layers
-  dLdW <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) False
+  dLdF <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) False
 
-  pure (ndy, dLdW)
+  pure (dLdX, dLdF)
 
 conAvg :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, id) -> [ConvolveG mx fw fh fd id] -> m (ConvolveG mx fw fh fd id)
-conAvg _ gds = avgMxs gds
+conAvg _ gds = cellAvgMxs gds
 
-conUpd :: forall m mx fw fh fd id mod igm. (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd), GradientMod m igm mod (ConvolveG mx fw fh fd id)) => Proxy '(fw, fh, fd, id) -> ConvolveSt mx fw fh fd id -> ConvolveG mx fw fh fd id -> igm -> Maybe mod -> m (ConvolveSt mx fw fh fd id, mod)
-conUpd _ wgt dw igm mod = do
-  (dw', mod') <- modGradient igm mod dw
-  dwOut <- subtractM wgt dw'
-  pure (dwOut, mod')
+conUpd :: forall m mx fw fh fd id gconf gst. (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd), GradientDescentMethod m mx gconf gst fw fh (id GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, id) -> gconf -> ConvolveSt mx fw fh fd id gst -> ConvolveG mx fw fh fd id -> m (ConvolveSt mx fw fh fd id gst)
+conUpd _ gconf (ConvolveSt wgt gst) dw = do
+  (wgt', gst') <- updateWeights gconf gst wgt dw
+  pure (ConvolveSt wgt' (Just gst'))
 
 conInit ::
-  forall g m mx dpo fw fh di.
+  forall g m mx dpo fw fh di gst.
   (RandomGen g, BlasM m mx, KnownNat dpo, KnownNat fw, KnownNat fh, KnownNat di, KnownNat (di GHC.TypeLits.* dpo)) =>
   Proxy '(fw, fh, dpo, di) ->
   (g -> (Double, g)) ->
   g ->
-  m (ConvolveSt mx fw fh dpo di, g)
+  m (ConvolveSt mx fw fh dpo di gst, g)
 conInit _ rf gen =
   let (filt, gen1) = netRandoms rf gen (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh) * natVal (Proxy :: Proxy (di GHC.TypeLits.* dpo)))
    in do
         fmx <- mxFromList filt (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* dpo))
-        pure $ (fmx, gen1)
+        pure $ (ConvolveSt fmx Nothing, gen1)
 
 convolve ::
-  forall m mx wi hi di wo ho g fw fh fd sx sy pxl pxr pyt pyb amod bmod igm.
+  forall m mx wi hi di wo ho g fw fh fd sx sy pxl pxr pyt pyb gconf gst gbst.
   ( BlasM m mx,
     KnownNat wi,
     KnownNat hi,
@@ -197,8 +197,8 @@ convolve ::
     -- verified true for convolve x dy
     ((((hi + pyt) + pyb) - (ho + ((ho - 1) GHC.TypeLits.* (sy - 1)))) + 1) ~ fh,
     ((((wi + pxl) + pxr) - (wo + ((wo - 1) GHC.TypeLits.* (sx - 1)))) + 1) ~ fw,
-    GradientMod m igm amod (ConvolveG mx fw fh fd di),
-    GradientMod m igm bmod (Matrix mx 1 1 fd)
+    GradientDescentMethod m mx gconf gst fw fh (di GHC.TypeLits.* fd),
+    GradientDescentMethod m mx gconf gbst 1 1 fd
   ) =>
   -- | filter size, the filter depth specified matches the # of output layers
   Proxy '(fw, fh, fd) ->
@@ -207,7 +207,7 @@ convolve ::
   -- | Padding size
   Proxy '(pxl, pxr, pyt, pyb) ->
   -- | filter depth is dpo / di
-  Layer m mx (ConvolveSt mx fw fh fd di, Matrix mx 1 1 fd) (ConvolveIn mx wi hi di, ()) (ConvolveG mx fw fh fd di, Matrix mx 1 1 fd) wi hi di wo ho fd igm (amod, bmod) g
+  Layer m mx (ConvolveSt mx fw fh fd di gst, LayerBiasSt mx fd gbst) (ConvolveIn mx wi hi di, ()) (ConvolveG mx fw fh fd di, Matrix mx 1 1 fd) wi hi di wo ho fd gconf (gst, gbst) g
 convolve pxf pxs pxp =
   let px = Proxy :: Proxy '(fw, fh, fd, di)
    in (Layer (conForward pxs pxp) (conBackward pxs pxp) (conAvg px) (conUpd px) (conInit px)) `connect` layerBias (Proxy :: Proxy '(wo, ho, fd))

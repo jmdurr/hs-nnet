@@ -12,32 +12,33 @@ import GHC.TypeLits
 import ML.NNet
 import System.Random
 
-data DropoutSt g = DropoutSt g Double
+data DropoutSt mx w h d g = DropoutSt g Double (Matrix mx w h d)
 
-data DropoutV mx w h d g = DropoutV g (Matrix mx w h d)
+dropoutF :: forall w h d m mx g. (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => DropoutSt mx w h d g -> Matrix mx w h d -> m (Matrix mx w h d, ())
+dropoutF (DropoutSt gen rate dmx) mx = do
+  r <- mult mx dmx
+  pure (r, ())
 
-dropoutF :: forall w h d m mx g. (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => DropoutSt g -> Matrix mx w h d -> m (Matrix mx w h d, DropoutV mx w h d g)
-dropoutF (DropoutSt gen rate) mx = do
-  (dmx, gen') <- randomMx (randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
-  dmx' <- applyFunction dmx (If (IfLt Value (Const rate)) (Const 0) (Const 1))
-  r <- mult mx dmx'
-  pure (r, DropoutV gen' dmx')
-
-dropoutB :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => DropoutSt g -> DropoutV mx w h d g -> Matrix mx w h d -> m (Matrix mx w h d, ())
-dropoutB _ (DropoutV _ dv) dz = do
-  r <- mult dz dv -- gradients that were dropped out are 0
+dropoutB :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => DropoutSt mx w h d g -> () -> Matrix mx w h d -> m (Matrix mx w h d, ())
+dropoutB (DropoutSt gen rate dmx) _ dz = do
+  r <- mult dz dmx -- gradients that were dropped out are 0
   pure (r, ())
 
 dropoutAvg :: Monad m => [()] -> m ()
 dropoutAvg _ = pure ()
 
-dropoutUpd :: (Monad m, GradientMod m igm mod ()) => DropoutSt g -> () -> igm -> Maybe mod -> m (DropoutSt g, mod)
-dropoutUpd st _ igm mod = do
-  (_, mod') <- modGradient igm mod ()
-  pure (st, mod')
+-- (gconf -> lst -> gd -> m lst) ->
+dropoutUpd :: forall m mx g w h d conf. (BlasM m mx, RandomGen g, KnownNat w, KnownNat h, KnownNat d) => conf -> DropoutSt mx w h d g -> () -> m (DropoutSt mx w h d g)
+dropoutUpd _ (DropoutSt gen rate dmx) _ = do
+  (dmx1, gen') <- randomMx (randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
+  dmx2 <- applyFunction dmx1 (If (IfLt Value (Const rate)) (Const 0) (Const 1))
+  pure (DropoutSt gen' rate dmx2)
 
-dropout :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g, GradientMod m igm mod ()) => g -> Double -> Layer m mx (DropoutSt g) (DropoutV mx w h d g) () w h d w h d igm mod g
-dropout gen rate = Layer dropoutF dropoutB dropoutAvg dropoutUpd (dropoutInit (DropoutSt gen rate))
+dropout :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => g -> Double -> Layer m mx (DropoutSt mx w h d g) () () w h d w h d gconf mod g
+dropout gen rate = Layer dropoutF dropoutB dropoutAvg dropoutUpd (dropoutInit gen rate)
 
-dropoutInit :: (Monad m, RandomGen g) => (DropoutSt g) -> (g -> (Double, g)) -> g -> m (DropoutSt g, g)
-dropoutInit ds _ g = pure (ds, g)
+dropoutInit :: forall w h d m mx g. (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => g -> Double -> (g -> (Double, g)) -> g -> m (DropoutSt mx w h d g, g)
+dropoutInit gen rate _ g = do
+  (dmx, gen') <- randomMx (randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
+  dmx' <- applyFunction dmx (If (IfLt Value (Const rate)) (Const 0) (Const 1))
+  pure (DropoutSt gen' rate dmx', g)

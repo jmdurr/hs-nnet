@@ -12,9 +12,11 @@ import ML.NNet
 import System.Random
 
 -- | Layer State
-data FFN mx i o = FFN
+data FFN mx i o gst gst2 = FFN
   { ffnW :: Matrix mx i o 1, -- weights by outputs, rows = inputs, cols = outputs -- 128,1
-    ffnB :: Vector mx o
+    ffnB :: Vector mx o,
+    ffnWGst :: Maybe gst,
+    ffnBGst :: Maybe gst2
   }
 
 -- | Input State
@@ -26,13 +28,13 @@ data FFNGrad mx i o = FFNGrad
     ffnBGrad :: Vector mx o
   }
 
-forwardProp :: (KnownNat i, KnownNat o, BlasM m mx) => FFN mx i o -> Vector mx i -> m (Vector mx o, FFNIn mx i)
+forwardProp :: (KnownNat i, KnownNat o, BlasM m mx) => FFN mx i o mod mod2 -> Vector mx i -> m (Vector mx o, FFNIn mx i)
 forwardProp ffn input = do
   mr <- ffnW ffn `dense` input -- outputs Mat i o 1 -> Mat 1 i 1 -> Mat o 1 1
   mr' <- ffnB ffn `add` mr -- Mat o 1 1
   pure (mr', input)
 
-backwardProp :: (Monad m, BlasM m mx, KnownNat i, KnownNat o, Show mx) => FFN mx i o -> FFNIn mx i -> Vector mx o -> m (Vector mx i, FFNGrad mx i o)
+backwardProp :: (Monad m, BlasM m mx, KnownNat i, KnownNat o, Show mx) => FFN mx i o mod mod2 -> FFNIn mx i -> Vector mx o -> m (Vector mx i, FFNGrad mx i o)
 backwardProp ffn ffnOldInput dSub = do
   mW <- outer dSub ffnOldInput
   -- nW <- subtractM (ffnW ffn) mW -- o rows, i columns for each input a column of weights
@@ -41,23 +43,21 @@ backwardProp ffn ffnOldInput dSub = do
 
 avgGrad :: (Monad m, BlasM m mx, KnownNat i, KnownNat o, Show mx) => [FFNGrad mx i o] -> m (FFNGrad mx i o)
 avgGrad [] = error "Cannot average empty gradient"
-avgGrad (g : gs) = go g gs
-  where
-    go g' [] = do
-      wg <- applyFunction (ffnWGrad g') (Div Value (Const (fromIntegral $ 1 + length gs)))
-      bg <- applyFunction (ffnBGrad g') (Div Value (Const (fromIntegral $ 1 + length gs)))
-      pure $ FFNGrad wg bg
-    go g' (ng : gs') = do
-      vw <- add (ffnWGrad g') (ffnWGrad ng)
-      vb <- add (ffnBGrad g') (ffnBGrad ng)
-      go (FFNGrad vw vb) gs'
+avgGrad gs = do
+  wg <- cellAvgMxs (map ffnWGrad gs)
+  bg <- cellAvgMxs (map ffnBGrad gs)
+  pure (FFNGrad wg bg)
 
-fsgdUpdate :: (Monad m, BlasM m mx, KnownNat i, KnownNat o, Show mx, GradientMod m igm mod (FFNGrad mx i o)) => FFN mx i o -> FFNGrad mx i o -> igm -> Maybe mod -> m (FFN mx i o, mod)
-fsgdUpdate (FFN w b) grad igm mod = do
-  (FFNGrad wg bg, mod') <- modGradient igm mod grad
-  w2 <- subtractM w wg
-  b2 <- subtractM b bg
-  pure (FFN w2 b2, mod')
+--     (lst -> gd -> GradientDescentMethod gmod -> Maybe gmod -> m (lst, gmod)) ->
+--     (Maybe state -> Matrix mx w h d -> Matrix mx w h d -> m (Matrix mx w h d, state)) ->
+-- don't know anything about mod... it is the internal gradient state
+-- need to keep two of these, one for weights and one for biases
+-- should carry it in FFN
+fsgdUpdate :: (Monad m, BlasM m mx, KnownNat i, KnownNat o, Show mx, GradientDescentMethod m mx conf mod i o 1, GradientDescentMethod m mx conf mod2 1 o 1) => conf -> FFN mx i o mod mod2 -> FFNGrad mx i o -> m (FFN mx i o mod mod2)
+fsgdUpdate conf ffn grad = do
+  (w', wgst) <- updateWeights conf (ffnWGst ffn) (ffnW ffn) (ffnWGrad grad)
+  (b', bgst) <- updateWeights conf (ffnBGst ffn) (ffnB ffn) (ffnBGrad grad)
+  pure (FFN w' b' (Just wgst) (Just bgst))
 
 {-
   (Maybe a -> Matrix mx w h d -> m (Matrix mx w h d, a))
@@ -67,10 +67,10 @@ fsgdUpdate (FFN w b) grad igm mod = do
 
 -- | create a fully connected sgd network given a learning rate
 -- m a wi hi di wo ho dpo
-fullyConnectedSGD :: (KnownNat i, KnownNat o, Monad m, BlasM m a, RandomGen g, GradientMod m igm mod (FFNGrad a i o)) => Proxy i -> Proxy o -> Layer m a (FFN a i o) (FFNIn a i) (FFNGrad a i o) 1 i 1 1 o 1 igm mod g
+fullyConnectedSGD :: (KnownNat i, KnownNat o, Monad m, BlasM m a, RandomGen g, GradientDescentMethod m a conf mod i o 1, GradientDescentMethod m a conf mod2 1 o 1) => Proxy i -> Proxy o -> Layer m a (FFN a i o mod mod2) (FFNIn a i) (FFNGrad a i o) 1 i 1 1 o 1 conf (mod, mod2) g
 fullyConnectedSGD nip nop = Layer forwardProp backwardProp avgGrad fsgdUpdate (fullyConnectedSGDInit nip nop)
 
-fullyConnectedSGDInit :: (BlasM m mx, KnownNat i, KnownNat o, RandomGen g) => Proxy i -> Proxy o -> (g -> (Double, g)) -> g -> m (FFN mx i o, g)
+fullyConnectedSGDInit :: (BlasM m mx, KnownNat i, KnownNat o, RandomGen g) => Proxy i -> Proxy o -> (g -> (Double, g)) -> g -> m (FFN mx i o mod mod2, g)
 fullyConnectedSGDInit nip nop f gen =
   let (nw, gen1) = netRandoms f gen (fromIntegral $ natVal nip * natVal nop)
       (nb, gen2) = netRandoms f gen1 (fromIntegral $ natVal nop)
@@ -80,7 +80,7 @@ fullyConnectedSGDInit nip nop f gen =
         --liftIO $ putStrLn $ "mxFromList fc sgd init 2 - " <> show (length nb)
         nb' <- mxFromList nb (undefined :: Proxy 1) nop (undefined :: Proxy 1)
         --liftIO $ putStrLn "mxFromList fc sgd init e"
-        pure (FFN nw' nb', gen2)
+        pure (FFN nw' nb' Nothing Nothing, gen2)
 
 -- o x i doubles
 -- o doubles

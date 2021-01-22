@@ -31,12 +31,10 @@ sigBackward _ sig dz = do
 sigAvg :: Monad m => [()] -> m ()
 sigAvg _ = pure ()
 
-sigUpd :: (Monad m, GradientMod m igm mod ()) => () -> () -> igm -> Maybe mod -> m ((), mod)
-sigUpd _ _ igm mod = do
-  (_, mod') <- modGradient igm mod ()
-  pure ((), mod')
+sigUpd :: (Monad m) => conf -> () -> () -> m ()
+sigUpd _ _ _ = pure ()
 
-sigmoid :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g, GradientMod m igm mod ()) => Proxy '(w, h, d) -> Layer m mx () (SigmoidIn mx w h d) () w h d w h d igm mod g
+sigmoid :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy '(w, h, d) -> Layer m mx () (SigmoidIn mx w h d) () w h d w h d conf mod g
 sigmoid _ = Layer sigForward sigBackward sigAvg sigUpd sigmoidInit
 
 sigmoidInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)

@@ -17,6 +17,6 @@ spec = do
     it "should leakyrelu forward" $ do
       v <- withCLGpu (undefined :: Proxy CFloat) $ do
         i <- mxFromList [0, 1, -1, 2, -2, 2, -3, 3] (Proxy :: Proxy 2) (Proxy :: Proxy 2) (Proxy :: Proxy 2)
-        (mx, _) <- leakyReluForward LeakyReluSt i
+        (mx, _) <- leakyReluForward (LeakyReluSt 0.02) i
         mxToLists mx
       v `shouldBe` [[[0, 1], [-0.20000000298023224, 2]], [[-0.4000000059604645, 2], [-0.6000000238418579, 3]]]

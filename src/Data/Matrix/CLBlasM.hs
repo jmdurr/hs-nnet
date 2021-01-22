@@ -34,6 +34,7 @@ import GHC.TypeLits
 import Language.C.Quote.OpenCL
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class (ppr)
+import Text.Printf
 
 data NProxy (n :: Nat) = NProxy
 
@@ -52,12 +53,13 @@ data CLBlasState a = CLBlasState
     clCommandQueue :: CLCommandQueue,
     clDevices :: [CLDeviceID],
     -- , clMemoryPool :: ResourcePool CLMem
-    clCompiledFunctions :: Map Int (CLProgram, CLKernel),
+    clCompiledFunctions :: Map String (CLProgram, CLKernel),
     clCompiledConvolve :: Maybe (CLProgram, CLKernel),
     clCompiledConvolveLayers :: Maybe (CLProgram, CLKernel),
     clCompiledFlip :: Maybe (CLProgram, CLKernel),
     clCompiledSum :: Maybe (CLProgram, CLKernel),
     clCompiledAddLayer :: Maybe (CLProgram, CLKernel),
+    clCompiledMultLayer :: Maybe (CLProgram, CLKernel),
     clCompiledSumFlatten :: Maybe (CLProgram, CLKernel),
     clProxy :: Proxy a,
     clMatMult :: Maybe (CLProgram, CLKernel)
@@ -71,12 +73,14 @@ withCLGpu pxy st = do
   q <- clCreateCommandQueue ctx (head ds) []
   r <- liftIO clblasSetup
   --liftIO $ putStrLn "run state"
-  v <- fst <$> runStateT st (CLBlasState ctx q ds M.empty Nothing Nothing Nothing Nothing Nothing Nothing pxy Nothing)
+  v <- fst <$> runStateT st (CLBlasState ctx q ds M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing pxy Nothing)
   --liftIO $ putStrLn "end run"
   liftIO clblasTeardown
   pure v
 
 instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) => BlasM (StateT (CLBlasState a) m) (CLBlasMx a) where
+  nearZero = pure $ clblasTypeNearZero (Proxy :: Proxy a)
+
   dot (Matrix (CLBlasMx mem1 w1 h1 d1)) (Matrix (CLBlasMx mem2 w2 h2 d2)) = do
     cls <- get
     mem <- clCreateBuffer (clContext cls) clMemReadWrite 1 (clProxy cls)
@@ -177,6 +181,20 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
     clWaitForEvent e
     pure (Matrix (CLBlasMx memo w1 h1 d1))
 
+  multToAllWithDepth mx1@(Matrix (CLBlasMx mem1 w1 h1 d1)) mx2@(Matrix (CLBlasMx mem2 _ _ _)) = do
+    cls <- get
+    kern <- case clCompiledMultLayer cls of
+      Just (_, k) -> pure k
+      Nothing -> do
+        let code = BC.pack $ pretty 120 (ppr $ multLayerC cls)
+        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "multLayers"
+        put cls {clCompiledMultLayer = Just (prog, k')}
+        pure k'
+    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ w1 * h1 * d1) (clProxy cls)
+    e <- clRunKernel (clCommandQueue cls) kern [CLAPlain (fromIntegral d1 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo] (fromIntegral w1, Just (fromIntegral h1), Nothing)
+    clWaitForEvent e
+    pure (Matrix (CLBlasMx memo w1 h1 d1))
+
   subtractM mx1@(Matrix (CLBlasMx mem1 w1 h1 d1)) mx2@(Matrix (CLBlasMx mem2 w2 h2 d2)) = do
     cls <- get
     --liftIO $ putStrLn $ "Sub matrices: " <> show mx1 <> " - " <> show mx2
@@ -188,11 +206,11 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
     pure (Matrix (CLBlasMx memo w1 h1 d1))
 
   applyFunction (Matrix (CLBlasMx mem1 w1 h1 d1)) func =
-    let hsh = hash func
-        fname = T.unpack $ format (string % hex) "clblasm_" (fromIntegral hsh :: Word64)
+    let hsh = hashFuncToStr func
+        fname = "clblasm_" <> hsh
         sz = w1 * h1 * d1
         nm = clblasTypeCStringRep (undefined :: a)
-        ks t = "kernel void " <> fname <> "(const int n, global " <> nm <> "* A, global " <> nm <> "* B){ int id = get_global_id(0); if (id < n && id < get_global_size(0)){" <> nm <> " val = A[id]; B[id] = " <> funcToCode t "val" func <> ";}}"
+        ks t = "kernel void " <> fname <> "(const int n, global " <> nm <> "* consts, global " <> nm <> "* A, global " <> nm <> "* B){ int id = get_global_id(0); if (id < n && id < get_global_size(0)){" <> nm <> " val = A[id]; B[id] = " <> snd (funcToCode 0 t "val" func) <> ";}}"
         kernel t = BC.pack $ ks t
      in do
           cls <- get
@@ -206,7 +224,8 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
             -- compile program, update state
             Just (_, kern) -> pure kern
           --liftIO $ putStrLn "kernel s a"
-          e <- clRunKernel (clCommandQueue cls) k [CLAPlain (fromIntegral sz :: CInt), CLAMem mem1, CLAMem mem2] (fromIntegral sz, Nothing, Nothing)
+          cs <- constPtr func
+          e <- clRunKernel (clCommandQueue cls) k [CLAPlain (fromIntegral sz :: CInt), CLAMem cs, CLAMem mem1, CLAMem mem2] (fromIntegral sz, Nothing, Nothing)
           --liftIO $ putStrLn "kernel w"
           clWaitForEvent e
           --liftIO $ putStrLn "kernel e"
@@ -523,35 +542,98 @@ konstH v =
         --liftIO $ putStrLn "konst af"
         applyFunction (Matrix (CLBlasMx mem w h d)) (Const (fromRational $ toRational v))
 
-namedFuncToCode :: String -> String -> String -> MxFunction -> MxFunction -> String
-namedFuncToCode t vs fn f1 f2 = fn <> "(" <> funcToCode t vs f1 <> "," <> funcToCode t vs f2 <> ")"
+constPtr :: (Floating a, Storable a, MonadFail m, MonadIO m, MonadState (CLBlasState a) m) => MxFunction -> m (CLMem a)
+constPtr mxf = do
+  cls <- get
+  clBufferFromList (clContext cls) (clCommandQueue cls) (Prelude.map (fromRational . toRational) (dbs ++ [0.0]))
+  where
+    dbs = go mxf
+    go (Const d) = [d]
+    go (Exp f1 f2) = go f1 ++ go f2
+    go (Log f1) = go f1
+    go (Ln f1) = go f1
+    go (Div f1 f2) = go f1 ++ go f2
+    go (Mul f1 f2) = go f1 ++ go f2
+    go (Add f1 f2) = go f1 ++ go f2
+    go (Sub f1 f2) = go f1 ++ go f2
+    go (Min f1 f2) = go f1 ++ go f2
+    go (Max f1 f2) = go f1 ++ go f2
+    go (Sinh f) = go f
+    go (Cosh f) = go f
+    go (Sqrt f) = go f
+    go (Tanh f) = go f
+    go (If (IfGt l r) f1 f2) = go l ++ go r ++ go f1 ++ go f2
+    go (If (IfLt l r) f1 f2) = go l ++ go r ++ go f1 ++ go f2
+    go (If (IfEq l r) f1 f2) = go l ++ go r ++ go f1 ++ go f2
+    go (If (IfNe l r) f1 f2) = go l ++ go r ++ go f1 ++ go f2
+    go Value = []
 
-namedFuncToCode1 :: String -> String -> String -> MxFunction -> String
-namedFuncToCode1 t vs fn f1 = fn <> "(" <> funcToCode t vs f1 <> ")"
+hashFuncToStr :: MxFunction -> String
+hashFuncToStr mxf = go mxf
+  where
+    go (Const _) = "C"
+    go (Exp f1 f2) = "E" ++ go f1 ++ go f2
+    go (Log f1) = "L" ++ go f1
+    go (Ln f1) = "l" ++ go f1
+    go (Div f1 f2) = "d" ++ go f1 ++ go f2
+    go (Mul f1 f2) = "m" ++ go f1 ++ go f2
+    go (Add f1 f2) = "p" ++ go f1 ++ go f2
+    go (Sub f1 f2) = "M" ++ go f1 ++ go f2
+    go (Min f1 f2) = "x" ++ go f1 ++ go f2
+    go (Max f1 f2) = "X" ++ go f1 ++ go f2
+    go (Sinh f) = "s" ++ go f
+    go (Cosh f) = "c" ++ go f
+    go (Sqrt f) = "r" ++ go f
+    go (Tanh f) = "t" ++ go f
+    go (If (IfGt l r) f1 f2) = "G" ++ go l ++ go r ++ go f1 ++ go f2
+    go (If (IfLt l r) f1 f2) = "g" ++ go l ++ go r ++ go f1 ++ go f2
+    go (If (IfEq l r) f1 f2) = "e" ++ go l ++ go r ++ go f1 ++ go f2
+    go (If (IfNe l r) f1 f2) = "z" ++ go l ++ go r ++ go f1 ++ go f2
+    go Value = "v"
 
-funcToCode :: String -> String -> MxFunction -> String
-funcToCode t vs Value = vs
-funcToCode t vs (Exp f1 f2) = namedFuncToCode t vs "pow" f1 f2
-funcToCode t vs (Log f1) = "log10(" <> funcToCode t vs f1 <> ")"
-funcToCode t vs (Ln f1) = "log(" <> funcToCode t vs f1 <> ")"
-funcToCode t vs (Div f1 f2) = "(" <> funcToCode t vs f1 <> ") / (" <> funcToCode t vs f2 <> ")"
-funcToCode t vs (Mul f1 f2) = "(" <> funcToCode t vs f1 <> ") * (" <> funcToCode t vs f2 <> ")"
-funcToCode t vs (Add f1 f2) = "(" <> funcToCode t vs f1 <> ") + (" <> funcToCode t vs f2 <> ")"
-funcToCode t vs (Sub f1 f2) = "(" <> funcToCode t vs f1 <> ") - (" <> funcToCode t vs f2 <> ")"
-funcToCode t _ (Const d) = "(" <> t <> ")" <> show d
-funcToCode t vs (Min f1 f2) = namedFuncToCode t vs "min" f1 f2
-funcToCode t vs (Max f1 f2) = namedFuncToCode t vs "max" f1 f2
-funcToCode t vs (Sinh f) = namedFuncToCode1 t vs "sinh" f
-funcToCode t vs (Cosh f) = namedFuncToCode1 t vs "cosh" f
-funcToCode t vs (Sqrt f) = namedFuncToCode1 t vs "sqrt" f
-funcToCode t vs (Tanh f) = namedFuncToCode1 t vs "tanh" f
-funcToCode t vs (If exp f1 f2) = "((" <> ifExpToCode exp t vs <> ") ? (" <> funcToCode t vs f1 <> ") : (" <> funcToCode t vs f2 <> "))"
+withFuncToCode :: Int -> String -> String -> MxFunction -> (String -> String) -> (Int, String)
+withFuncToCode i t vs fx sf =
+  let (i', s') = funcToCode i t vs fx
+   in (i', sf s')
 
-ifExpToCode :: IfExp -> String -> String -> String
-ifExpToCode (IfGt l r) t vs = "(" <> funcToCode t vs l <> ") > (" <> funcToCode t vs r <> ")"
-ifExpToCode (IfLt l r) t vs = "(" <> funcToCode t vs l <> ") < (" <> funcToCode t vs r <> ")"
-ifExpToCode (IfEq l r) t vs = "(" <> funcToCode t vs l <> ") == (" <> funcToCode t vs r <> ")"
-ifExpToCode (IfNe l r) t vs = "(" <> funcToCode t vs l <> ") != (" <> funcToCode t vs r <> ")"
+seqWithFuncToCode :: Int -> String -> String -> MxFunction -> MxFunction -> (String -> String -> String) -> (Int, String)
+seqWithFuncToCode i t vs f1 f2 sf =
+  let (i1, s1) = funcToCode i t vs f1
+      (i2, s2) = funcToCode i1 t vs f2
+   in (i2, sf s1 s2)
+
+seqWithFuncToCode3 :: Int -> String -> String -> MxFunction -> MxFunction -> MxFunction -> (String -> String -> String -> String) -> (Int, String)
+seqWithFuncToCode3 i t vs f1 f2 f3 sf =
+  let (i1, s1) = funcToCode i t vs f1
+      (i2, s2) = funcToCode i1 t vs f2
+      (i3, s3) = funcToCode i2 t vs f3
+   in (i3, sf s1 s2 s3)
+
+funcToCode :: Int -> String -> String -> MxFunction -> (Int, String)
+funcToCode i t vs Value = (i, vs)
+funcToCode i t vs (Exp f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "pow(%s,%s)")
+funcToCode i t vs (Log f1) = withFuncToCode i t vs f1 (printf "log10(%s)")
+funcToCode i t vs (Ln f1) = withFuncToCode i t vs f1 (printf "log(%s)")
+funcToCode i t vs (Div f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "(%s)/(%s)")
+funcToCode i t vs (Mul f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "(%s)*(%s)")
+funcToCode i t vs (Add f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "(%s)+(%s)")
+funcToCode i t vs (Sub f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "(%s)-(%s)")
+funcToCode i t _ (Const d) = (i + 1, "consts[" <> show i <> "]")
+funcToCode i t vs (Min f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "min(%s,%s)")
+funcToCode i t vs (Max f1 f2) = seqWithFuncToCode i t vs f1 f2 (printf "max(%s,%s)")
+funcToCode i t vs (Sinh f) = withFuncToCode i t vs f (printf "sinh(%s)")
+funcToCode i t vs (Cosh f) = withFuncToCode i t vs f (printf "cosh(%s)")
+funcToCode i t vs (Sqrt f) = withFuncToCode i t vs f (printf "sqrt(%s)")
+funcToCode i t vs (Tanh f) = withFuncToCode i t vs f (printf "tanh(%s)")
+funcToCode i t vs (If exp f1 f2) =
+  let (i', s) = ifExpToCode i exp t vs
+   in seqWithFuncToCode i' t vs f1 f2 (printf "((%s)?(%s):(%s))" s)
+
+ifExpToCode :: Int -> IfExp -> String -> String -> (Int, String)
+ifExpToCode i (IfGt l r) t vs = seqWithFuncToCode i t vs l r (printf "(%s)>(%s)")
+ifExpToCode i (IfLt l r) t vs = seqWithFuncToCode i t vs l r (printf "(%s)<(%s)")
+ifExpToCode i (IfEq l r) t vs = seqWithFuncToCode i t vs l r (printf "(%s)==(%s)")
+ifExpToCode i (IfNe l r) t vs = seqWithFuncToCode i t vs l r (printf "(%s)!=(%s)")
 
 sumLayersH :: forall w h d a m. (CLBlasType a, MonadState (CLBlasState a) m, MonadIO m, MonadFail m, BlasM m (CLBlasMx a), Storable a, Floating a, KnownNat w, KnownNat h, KnownNat d) => Matrix (CLBlasMx a) w h d -> m (Matrix (CLBlasMx a) 1 1 d)
 sumLayersH (Matrix (CLBlasMx mem1 wm hm dpt)) = do
@@ -608,6 +690,20 @@ addLayerC cls =
             for (int k = 0; k < d; ++k){
               int pos = k*w*h + y*w + x;
               out[pos] = mx[pos] + v[k];
+            }
+          } 
+     |]
+
+multLayerC cls =
+  let typ = ctypes cls
+   in [cfun|kernel void multLayers(int d, const global $ty:typ * mx, const global $ty:typ * v, global $ty:typ * out){
+            int x = get_global_id(0);
+            int w = get_global_size(0);
+            int y = get_global_id(1);
+            int h = get_global_size(1);
+            for (int k = 0; k < d; ++k){
+              int pos = k*w*h + y*w + x;
+              out[pos] = mx[pos] * v[k];
             }
           } 
      |]

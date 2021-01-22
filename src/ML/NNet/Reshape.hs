@@ -33,19 +33,16 @@ reshapeAvg :: Monad m => [()] -> m ()
 reshapeAvg _ = pure ()
 
 reshapeUpd ::
-  (Monad m, GradientMod m igm mod ()) =>
+  (Monad m) =>
+  conf ->
   () ->
   () ->
-  igm ->
-  Maybe mod ->
-  m ((), mod)
-reshapeUpd _ _ igm mod = do
-  (_, mod') <- modGradient igm mod ()
-  pure ((), mod')
+  m ()
+reshapeUpd _ _ _ = pure ()
 
 reshape ::
-  (KnownNat w, KnownNat h, KnownNat d, KnownNat w2, KnownNat h2, KnownNat d2, KnownNat (w GHC.TypeLits.* h), KnownNat (w2 GHC.TypeLits.* h2), (w GHC.TypeLits.* h GHC.TypeLits.* d) ~ (w2 GHC.TypeLits.* h2 GHC.TypeLits.* d2), BlasM m mx, RandomGen g, GradientMod m igm mod ()) =>
-  Layer m mx () () () w h d w2 h2 d2 igm mod g
+  (KnownNat w, KnownNat h, KnownNat d, KnownNat w2, KnownNat h2, KnownNat d2, KnownNat (w GHC.TypeLits.* h), KnownNat (w2 GHC.TypeLits.* h2), (w GHC.TypeLits.* h GHC.TypeLits.* d) ~ (w2 GHC.TypeLits.* h2 GHC.TypeLits.* d2), BlasM m mx, RandomGen g) =>
+  Layer m mx () () () w h d w2 h2 d2 gst mod g
 reshape = Layer reshapeForward reshapeBackward reshapeAvg reshapeUpd reshapeInit
 
 reshapeInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)

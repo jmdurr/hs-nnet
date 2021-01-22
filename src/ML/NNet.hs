@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds #-}
+{-# LANGUAGE ExplicitForAll #-}
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE FunctionalDependencies #-}
@@ -15,37 +16,27 @@ import Data.Proxy
 import GHC.TypeLits
 import System.Random
 
--- | Method to apply various gradient techniques
-class (Monad m) => GradientMod m i a b | i b -> a where
-  modGradient :: i -> Maybe a -> b -> m (b, a)
-
-instance (Monad m, GradientMod m i a b, GradientMod m i c d) => GradientMod m i (a, c) (b, d) where
-  modGradient i Nothing (b, d) = do
-    (b', a) <- modGradient i Nothing b
-    (d', c) <- modGradient i Nothing d
-    pure ((b', d'), (a, c))
-  modGradient i (Just (a, c)) (b, d) = do
-    (b', a') <- modGradient i (Just a) b
-    (d', c') <- modGradient i (Just c) d
-    pure ((b', d'), (a', c'))
+class (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMethod m mx conf state w h d | conf mx w h d -> state where
+  updateWeights ::
+    (conf -> Maybe state -> Matrix mx w h d -> Matrix mx w h d -> m (Matrix mx w h d, state))
 
 -- | Layer has an input and an output
-data Layer m mx lst ist gd wi hi di wo ho dpo igm gmod g where
+data Layer m mx lst ist gd wi hi di wo ho dpo gconf gmod g where
   Layer ::
-    (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, RandomGen g, GradientMod m igm gmod gd) =>
+    (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, RandomGen g) =>
     -- | forward prop
     (lst -> Matrix mx wi hi di -> m (Matrix mx wo ho dpo, ist)) ->
     -- | backward prop
     (lst -> ist -> Matrix mx wo ho dpo -> m (Matrix mx wi hi di, gd)) ->
     -- | gradient average
     ([gd] -> m gd) ->
-    -- | gradient update
-    (lst -> gd -> igm -> Maybe gmod -> m (lst, gmod)) ->
+    -- | gradient update, uses GradientDescentMethod gmod
+    (gconf -> lst -> gd -> m lst) ->
     -- | init function
     ((g -> (Double, g)) -> g -> m (lst, g)) ->
-    Layer m mx lst ist gd wi hi di wo ho dpo igm gmod g
+    Layer m mx lst ist gd wi hi di wo ho dpo gconf gmod g
 
-connectForward :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo igm agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bgmod g -> (alst, blst) -> Matrix mx wi hi di -> m (Matrix mx wo2 ho2 dpo2, (aist, bist))
+connectForward :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> (alst, blst) -> Matrix mx wi hi di -> m (Matrix mx wo2 ho2 dpo2, (aist, bist))
 connectForward (Layer l1f _ _ _ _) (Layer l2f _ _ _ _) (a, b) mx = do
   -- forward a mx
   -- forward b mx
@@ -54,13 +45,13 @@ connectForward (Layer l1f _ _ _ _) (Layer l2f _ _ _ _) (a, b) mx = do
   (mxo, b') <- l2f b mx'
   pure (mxo, (a', b'))
 
-connectBackward :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo igm agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bgmod g -> (alst, blst) -> (aist, bist) -> Matrix mx wo2 ho2 dpo2 -> m (Matrix mx wi hi di, (gda, gdb))
+connectBackward :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> (alst, blst) -> (aist, bist) -> Matrix mx wo2 ho2 dpo2 -> m (Matrix mx wi hi di, (gda, gdb))
 connectBackward (Layer _ l2a _ _ _) (Layer _ l2b _ _ _) (a, b) (ai, bi) mx = do
   (mx', b') <- l2b b bi mx
   (mxo, a') <- l2a a ai mx'
   pure (mxo, (a', b'))
 
-connectInit :: (RandomGen g, Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo igm agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bgmod g -> ((g -> (Double, g)) -> g -> m ((alst, blst), g))
+connectInit :: (RandomGen g, Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> ((g -> (Double, g)) -> g -> m ((alst, blst), g))
 connectInit (Layer _ _ _ _ l1) (Layer _ _ _ _ l2) f gen = do
   --liftIO $ putStrLn "init 1"
   (a, g') <- l1 f gen
@@ -68,14 +59,16 @@ connectInit (Layer _ _ _ _ l1) (Layer _ _ _ _ l2) f gen = do
   (b, g2) <- l2 f g'
   pure ((a, b), g2)
 
-connectUpdate :: (GradientMod m igm amod gda, GradientMod m igm bmod gdb, Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo igm amod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bmod g -> (alst, blst) -> (gda, gdb) -> igm -> Maybe (amod, bmod) -> m ((alst, blst), (amod, bmod))
-connectUpdate (Layer _ _ _ l1 _) (Layer _ _ _ l2 _) (a, b) (ga, gb) igm mods =
+connectUpdate :: (Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo conf gst g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 conf gbst g -> conf -> (alst, blst) -> (gda, gdb) -> m (alst, blst)
+connectUpdate (Layer _ _ _ l1 _) (Layer _ _ _ l2 _) c (a, b) (ga, gb) =
   do
-    (b', bmod') <- l2 b gb igm (snd <$> mods)
-    (a', amod') <- l1 a ga igm (fst <$> mods)
-    pure ((a', b'), (amod', bmod'))
+    bst' <- l2 c b gb
+    ast' <- l1 c a ga
+    pure (ast', bst')
 
-connectAverage :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo igm agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bgmod g -> [(gda, gdb)] -> m (gda, gdb)
+--(Maybe state -> Matrix mx w h d -> Matrix mx w h d -> m (Matrix mx w h d, state)) ->
+
+connectAverage :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> [(gda, gdb)] -> m (gda, gdb)
 connectAverage (Layer _ _ l1 _ _) (Layer _ _ l2 _ _) gs =
   let (gdas, gdbs) = unzip gs
    in do
@@ -84,10 +77,10 @@ connectAverage (Layer _ _ l1 _ _) (Layer _ _ l2 _ _) gs =
         pure (ma, mb)
 
 connect ::
-  (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g, GradientMod m igm agmod gda, GradientMod m igm bgmod gdb) =>
-  Layer m mx alst aist gda wi hi di wo ho dpo igm agmod g ->
-  Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 igm bgmod g ->
-  Layer m mx (alst, blst) (aist, bist) (gda, gdb) wi hi di wo2 ho2 dpo2 igm (agmod, bgmod) g
+  (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g) =>
+  Layer m mx alst aist gda wi hi di wo ho dpo conf gst g ->
+  Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 conf gbst g ->
+  Layer m mx (alst, blst) (aist, bist) (gda, gdb) wi hi di wo2 ho2 dpo2 conf (gst, gbst) g
 connect l1 l2 =
   Layer
     (connectForward l1 l2)
@@ -96,52 +89,51 @@ connect l1 l2 =
     (connectUpdate l1 l2)
     (connectInit l1 l2)
 
-data Network m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g = Network (Layer m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g)
+data Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g = Network (Layer m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g) gconf
 
 initNetwork ::
   (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, RandomGen g) =>
   g ->
   (g -> (Double, g)) ->
-  Layer m mx alst aist gd wi hi di wo ho dpo igm mod g ->
-  m (Network m mx alst aist gd wi hi di wo ho dpo igm mod g, alst, g)
-initNetwork gen f l@(Layer _ _ _ _ init) = do
+  Layer m mx alst aist gd wi hi di wo ho dpo gconf mod g ->
+  gconf ->
+  m (Network m mx alst aist gd wi hi di wo ho dpo gconf mod g, alst, g)
+initNetwork gen f l@(Layer _ _ _ _ init) gc = do
   (a, g') <- init f gen
-  pure (Network l, a, g')
+  pure (Network l gc, a, g')
 
 -- runForward gives the outputs
 runForward ::
   (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g) =>
-  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g ->
+  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g ->
   alst ->
   Matrix mx wi hi di ->
   m (Matrix mx wo2 ho2 dpo2, aist)
-runForward (Network l@(Layer for _ _ _ _)) a mx = for a mx
+runForward (Network l@(Layer for _ _ _ _) _) a mx = for a mx
 
 runBackward ::
   (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g) =>
-  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g ->
+  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g ->
   alst ->
   aist ->
   Matrix mx wo2 ho2 dpo2 ->
   m (Matrix mx wi hi di, gd)
-runBackward (Network l@(Layer _ bak _ _ _)) a ai dErr = bak a ai dErr
+runBackward (Network l@(Layer _ bak _ _ _) _) a ai dErr = bak a ai dErr
 
 runUpdate ::
-  (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g, GradientMod m igm mod gd) =>
-  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g ->
+  (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g) =>
+  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g ->
   alst ->
   gd ->
-  igm ->
-  Maybe mod ->
-  m (alst, mod)
-runUpdate (Network (Layer _ _ _ upd _)) a grad igm m = upd a grad igm m
+  m alst
+runUpdate (Network (Layer _ _ _ upd _) gc) a grad = upd gc a grad
 
 avgGradients ::
   (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo2, KnownNat ho2, KnownNat dpo2, RandomGen g) =>
-  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 igm mod g ->
+  Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g ->
   [gd] ->
   m gd
-avgGradients (Network (Layer _ _ avg _ _)) g = avg g
+avgGradients (Network (Layer _ _ avg _ _) _) g = avg g
 
 netRandoms :: (g -> (Double, g)) -> g -> Int -> ([Double], g)
 netRandoms _ gen 0 = ([], gen)

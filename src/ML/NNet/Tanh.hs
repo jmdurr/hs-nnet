@@ -27,12 +27,10 @@ tanB _ tv dz = do
 tanAvg :: Monad m => [()] -> m ()
 tanAvg _ = pure ()
 
-tanUpd :: (Monad m, GradientMod m igm mod ()) => () -> () -> igm -> Maybe mod -> m ((), mod)
-tanUpd _ _ igm mod = do
-  (_, mod') <- modGradient igm mod ()
-  pure ((), mod')
+tanUpd :: (Monad m) => conf -> () -> () -> m ()
+tanUpd _ _ _ = pure ()
 
-tanH :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g, GradientMod m igm mod ()) => Proxy '(w, h, d) -> Layer m mx () (TanV mx w h d) () w h d w h d igm mod g
+tanH :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy '(w, h, d) -> Layer m mx () (TanV mx w h d) () w h d w h d conf mod g
 tanH _ = Layer tanF tanB tanAvg tanUpd tanInit
 
 tanInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)
