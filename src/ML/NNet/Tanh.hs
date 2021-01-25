@@ -8,6 +8,7 @@ import Data.BlasM
 import Data.Proxy
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 type TanV mx w h d = Matrix mx w h d
@@ -33,5 +34,5 @@ tanUpd _ _ _ = pure ()
 tanH :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy '(w, h, d) -> Layer m mx () (TanV mx w h d) () w h d w h d conf mod g
 tanH _ = Layer tanF tanB tanAvg tanUpd tanInit
 
-tanInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)
+tanInit :: (Monad m, RandomGen g) => WeightInitializer g -> g -> m ((), g)
 tanInit _ g = pure ((), g)

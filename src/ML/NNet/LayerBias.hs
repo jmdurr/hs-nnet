@@ -12,6 +12,7 @@ import Data.BlasM
 import Data.Proxy
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 data LayerBiasSt mx d mod = LayerBiasSt (Matrix mx 1 1 d) (Maybe mod)
@@ -29,14 +30,7 @@ layerBiasBackward bias _ dz = do
 
 layerBiasAverageGrad :: (BlasM m mx, KnownNat d, Monad m) => [Matrix mx 1 1 d] -> m (Matrix mx 1 1 d)
 layerBiasAverageGrad [] = error "Cannot average empty gradient"
-layerBiasAverageGrad (g : gs) = go g gs
-  where
-    go g' [] = do
-      wg <- applyFunction g' (Div Value (Const (fromIntegral $ 1 + length gs)))
-      pure $ wg
-    go g' (ng : gs') = do
-      vw <- add g' ng
-      go vw gs'
+layerBiasAverageGrad mxs = cellAvgMxs mxs
 
 layerBiasUpdate :: (Monad m, BlasM m mx, KnownNat d, GradientDescentMethod m mx conf mod 1 1 d) => conf -> LayerBiasSt mx d mod -> Matrix mx 1 1 d -> m (LayerBiasSt mx d mod)
 layerBiasUpdate conf (LayerBiasSt bias modst) dbias = do
@@ -48,9 +42,12 @@ layerBiasUpdate conf (LayerBiasSt bias modst) dbias = do
 layerBias :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g, GradientDescentMethod m mx conf igm 1 1 d) => Proxy '(w, h, d) -> Layer m mx (LayerBiasSt mx d igm) () (Matrix mx 1 1 d) w h d w h d conf igm g
 layerBias px = Layer layerBiasForward layerBiasBackward layerBiasAverageGrad layerBiasUpdate layerBiasInit
 
-layerBiasInit :: forall m mx g d mod. (Monad m, RandomGen g, BlasM m mx, KnownNat d) => (g -> (Double, g)) -> g -> m (LayerBiasSt mx d mod, g)
-layerBiasInit rf g =
-  let (b', gen1) = netRandoms rf g (fromIntegral $ natVal (Proxy :: Proxy d))
-   in do
-        b <- mxFromList b' (Proxy :: Proxy 1) (Proxy :: Proxy 1) (Proxy :: Proxy d)
-        pure (LayerBiasSt b Nothing, gen1)
+layerBiasInit :: forall m mx g d mod. (Monad m, RandomGen g, BlasM m mx, KnownNat d) => WeightInitializer g -> g -> m (LayerBiasSt mx d mod, g)
+layerBiasInit rf g = konst 0.0 >>= \m -> pure (LayerBiasSt m Nothing, g)
+
+{-
+let (b', gen1) = netRandoms rf g (fromIntegral $ natVal (Proxy :: Proxy d))
+  in do
+       b <- mxFromList b' (Proxy :: Proxy 1) (Proxy :: Proxy 1) (Proxy :: Proxy d)
+       pure (LayerBiasSt b Nothing, gen1)
+ -}

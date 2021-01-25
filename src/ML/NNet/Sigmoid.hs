@@ -8,6 +8,7 @@ import Data.BlasM
 import Data.Proxy
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 euler :: Double
@@ -37,6 +38,6 @@ sigUpd _ _ _ = pure ()
 sigmoid :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy '(w, h, d) -> Layer m mx () (SigmoidIn mx w h d) () w h d w h d conf mod g
 sigmoid _ = Layer sigForward sigBackward sigAvg sigUpd sigmoidInit
 
-sigmoidInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)
+sigmoidInit :: (Monad m, RandomGen g) => WeightInitializer g -> g -> m ((), g)
 sigmoidInit _ g = do
   pure ((), g)

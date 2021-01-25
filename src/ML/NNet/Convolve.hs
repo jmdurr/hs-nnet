@@ -15,6 +15,7 @@ import Data.Proxy
 import Debug.Trace
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import ML.NNet.LayerBias
 import System.Random
 
@@ -145,11 +146,13 @@ conInit ::
   forall g m mx dpo fw fh di gst.
   (RandomGen g, BlasM m mx, KnownNat dpo, KnownNat fw, KnownNat fh, KnownNat di, KnownNat (di GHC.TypeLits.* dpo)) =>
   Proxy '(fw, fh, dpo, di) ->
-  (g -> (Double, g)) ->
+  WeightInitializer g ->
   g ->
   m (ConvolveSt mx fw fh dpo di gst, g)
 conInit _ rf gen =
-  let (filt, gen1) = netRandoms rf gen (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh) * natVal (Proxy :: Proxy (di GHC.TypeLits.* dpo)))
+  let (filt, gen1) = netRandoms rf gen (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh) * natVal (Proxy :: Proxy (di GHC.TypeLits.* dpo))) fin fout
+      fin = (fromIntegral $ natVal (Proxy :: Proxy di) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
+      fout = (fromIntegral $ natVal (Proxy :: Proxy dpo) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
    in do
         fmx <- mxFromList filt (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* dpo))
         pure $ (ConvolveSt fmx Nothing, gen1)

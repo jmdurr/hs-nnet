@@ -21,12 +21,14 @@ type MomentumSt mx w h d = Matrix mx w h d
 
 instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMethod m mx Momentum (MomentumSt mx w h d) w h d where
   updateWeights (Momentum rate gain) Nothing wgt grad = do
-    vo2 <- scale grad (- rate)
-    wgt' <- add wgt vo2
-    pure (wgt', vo2)
+    vdw <- scale grad (1 - gain)
+    vdws <- scale vdw (- rate)
+    wgt' <- add wgt vdws
+    pure (wgt', vdw)
   updateWeights (Momentum rate gain) (Just vo) wgt grad = do
     vo1 <- scale vo gain
-    vo2 <- scale grad (- rate)
+    vo2 <- scale grad (1 - gain)
     vo3 <- add vo1 vo2
-    wgt' <- add wgt vo3
+    vo4 <- scale vo3 (- rate)
+    wgt' <- add wgt vo4
     pure (wgt', vo3)

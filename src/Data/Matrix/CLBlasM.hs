@@ -17,7 +17,6 @@ import Control.Monad.State.Strict
 import Data.BlasM
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as BC
-import Data.Hashable
 import Data.List (intercalate)
 import Data.Map.Strict as M
 import Data.Matrix.CLBlas

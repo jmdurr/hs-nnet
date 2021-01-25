@@ -2,7 +2,7 @@ name:                blast-matrix
 version:             0.1.0.0
 -- synopsis:
 -- description:
-homepage:            https://github.com/jmdurr/blast-matrix#readme
+homepage:            https://github.com/jmdurr/hs-nnet#readme
 license:             BSD3
 license-file:        LICENSE
 author:              Jonathan Durr
@@ -49,12 +49,12 @@ library
                        vector,
                        containers,
                        bytestring,
-                       hashable,
                        random,
                        formatting,
                        text,
                        language-c-quote,
-                       mainland-pretty
+                       mainland-pretty,
+                       normaldistribution
                        --iee754
 
   default-language:    Haskell2010
@@ -85,4 +85,4 @@ test-suite spec
 
 source-repository head
   type:     git
-  location: https://github.com/githubuser/blast-matrix
+  location: https://github.com/jmdurr/hs-nnet

@@ -16,12 +16,12 @@ spec =
   describe "small feed forward network" $ do
     it "should initialize weights" $ do
       v <- withCLGpu (undefined :: Proxy CFloat) $ do
-        (n, _) <- fullyConnectedSGDInit (Proxy :: Proxy 2) (Proxy :: Proxy 3) (const (1.0, mkStdGen 2)) (mkStdGen 2)
+        (n, _) <- fullyConnectedSGDInit (Proxy :: Proxy 2) (Proxy :: Proxy 3) (\_ _ -> const (1.0, mkStdGen 2)) (mkStdGen 2)
         mxToLists (ffnW n)
       v `shouldBe` [[[1, 1], [1, 1], [1, 1]]]
     it "should initialize bias" $ do
       v <- withCLGpu (undefined :: Proxy CFloat) $ do
-        (n, _) <- fullyConnectedSGDInit (Proxy :: Proxy 2) (Proxy :: Proxy 3) (const (1.0, mkStdGen 2)) (mkStdGen 2)
+        (n, _) <- fullyConnectedSGDInit (Proxy :: Proxy 2) (Proxy :: Proxy 3) (\_ _ -> const (1.0, mkStdGen 2)) (mkStdGen 2)
         mxToLists (ffnB n)
       v `shouldBe` [[[1], [1], [1]]]
 

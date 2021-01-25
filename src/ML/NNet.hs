@@ -14,6 +14,7 @@ import Control.Monad.IO.Class
 import Data.BlasM
 import Data.Proxy
 import GHC.TypeLits
+import ML.NNet.Init.RandomFun
 import System.Random
 
 class (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMethod m mx conf state w h d | conf mx w h d -> state where
@@ -33,7 +34,7 @@ data Layer m mx lst ist gd wi hi di wo ho dpo gconf gmod g where
     -- | gradient update, uses GradientDescentMethod gmod
     (gconf -> lst -> gd -> m lst) ->
     -- | init function
-    ((g -> (Double, g)) -> g -> m (lst, g)) ->
+    (WeightInitializer g -> g -> m (lst, g)) ->
     Layer m mx lst ist gd wi hi di wo ho dpo gconf gmod g
 
 connectForward :: Monad m => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> (alst, blst) -> Matrix mx wi hi di -> m (Matrix mx wo2 ho2 dpo2, (aist, bist))
@@ -51,7 +52,7 @@ connectBackward (Layer _ l2a _ _ _) (Layer _ l2b _ _ _) (a, b) (ai, bi) mx = do
   (mxo, a') <- l2a a ai mx'
   pure (mxo, (a', b'))
 
-connectInit :: (RandomGen g, Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> ((g -> (Double, g)) -> g -> m ((alst, blst), g))
+connectInit :: (RandomGen g, Monad m) => Layer m mx alst aist gda wi hi di wo ho dpo agconf agmod g -> Layer m mx blst bist gdb wo ho dpo wo2 ho2 dpo2 bgconf bgmod g -> (WeightInitializer g -> g -> m ((alst, blst), g))
 connectInit (Layer _ _ _ _ l1) (Layer _ _ _ _ l2) f gen = do
   --liftIO $ putStrLn "init 1"
   (a, g') <- l1 f gen
@@ -94,7 +95,7 @@ data Network m mx alst aist gd wi hi di wo2 ho2 dpo2 gconf mod g = Network (Laye
 initNetwork ::
   (BlasM m mx, KnownNat wi, KnownNat hi, KnownNat di, KnownNat wo, KnownNat ho, KnownNat dpo, RandomGen g) =>
   g ->
-  (g -> (Double, g)) ->
+  WeightInitializer g ->
   Layer m mx alst aist gd wi hi di wo ho dpo gconf mod g ->
   gconf ->
   m (Network m mx alst aist gd wi hi di wo ho dpo gconf mod g, alst, g)
@@ -135,19 +136,19 @@ avgGradients ::
   m gd
 avgGradients (Network (Layer _ _ avg _ _) _) g = avg g
 
-netRandoms :: (g -> (Double, g)) -> g -> Int -> ([Double], g)
-netRandoms _ gen 0 = ([], gen)
-netRandoms f gen num =
-  let (d, g') = f gen
-      (ds, gs) = netRandoms f g' (num - 1)
+netRandoms :: WeightInitializer g -> g -> Int -> Int -> Int -> ([Double], g)
+netRandoms _ gen 0 _ _ = ([], gen)
+netRandoms f gen num fanIn fanOut =
+  let (d, g') = f fanIn fanOut gen
+      (ds, gs) = netRandoms f g' (num - 1) fanIn fanOut
    in (d : ds, gs)
 
-randomMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, RandomGen g) => (g -> (Double, g)) -> g -> Proxy w -> Proxy h -> Proxy d -> m (Matrix mx w h d, g)
+randomMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, RandomGen g) => WeightInitializer g -> g -> Proxy w -> Proxy h -> Proxy d -> m (Matrix mx w h d, g)
 randomMx f g pw ph pd =
   let w = fromIntegral $ natVal pw
       h = fromIntegral $ natVal ph
       d = fromIntegral $ natVal pd
-      (ls, g') = netRandoms f g (w * h * d)
+      (ls, g') = netRandoms f g (w * h * d) 0 0
    in do
         --liftIO $ putStrLn $ "NN rmx " <> show w <> ":" <> show h <> ":" <> show d <> ":" <> show (length ls)
         mx <- mxFromList ls pw ph pd

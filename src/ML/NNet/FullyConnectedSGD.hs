@@ -9,6 +9,7 @@ import Data.Proxy
 import Debug.Trace
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 -- | Layer State
@@ -70,17 +71,17 @@ fsgdUpdate conf ffn grad = do
 fullyConnectedSGD :: (KnownNat i, KnownNat o, Monad m, BlasM m a, RandomGen g, GradientDescentMethod m a conf mod i o 1, GradientDescentMethod m a conf mod2 1 o 1) => Proxy i -> Proxy o -> Layer m a (FFN a i o mod mod2) (FFNIn a i) (FFNGrad a i o) 1 i 1 1 o 1 conf (mod, mod2) g
 fullyConnectedSGD nip nop = Layer forwardProp backwardProp avgGrad fsgdUpdate (fullyConnectedSGDInit nip nop)
 
-fullyConnectedSGDInit :: (BlasM m mx, KnownNat i, KnownNat o, RandomGen g) => Proxy i -> Proxy o -> (g -> (Double, g)) -> g -> m (FFN mx i o mod mod2, g)
+fullyConnectedSGDInit :: (BlasM m mx, KnownNat i, KnownNat o, RandomGen g) => Proxy i -> Proxy o -> WeightInitializer g -> g -> m (FFN mx i o mod mod2, g)
 fullyConnectedSGDInit nip nop f gen =
-  let (nw, gen1) = netRandoms f gen (fromIntegral $ natVal nip * natVal nop)
-      (nb, gen2) = netRandoms f gen1 (fromIntegral $ natVal nop)
-   in do
+  let (nw, gen1) = netRandoms f gen (fromIntegral $ natVal nip * natVal nop) (fromIntegral $ natVal nip) (fromIntegral $ natVal nop)
+   in --(nb, gen2) = netRandoms f gen1 (fromIntegral $ natVal nop)
+      do
         --liftIO $ putStrLn $ "mxFromList fc sgd init 1 - " <> show (length nw)
         nw' <- mxFromList nw nip nop (undefined :: Proxy 1)
         --liftIO $ putStrLn $ "mxFromList fc sgd init 2 - " <> show (length nb)
-        nb' <- mxFromList nb (undefined :: Proxy 1) nop (undefined :: Proxy 1)
+        nb' <- konst 0.0
         --liftIO $ putStrLn "mxFromList fc sgd init e"
-        pure (FFN nw' nb' Nothing Nothing, gen2)
+        pure (FFN nw' nb' Nothing Nothing, gen1)
 
 -- o x i doubles
 -- o doubles

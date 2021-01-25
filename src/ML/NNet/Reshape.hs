@@ -10,6 +10,7 @@ import Data.BlasM
 import Debug.Trace
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 reshapeBackward ::
@@ -45,5 +46,5 @@ reshape ::
   Layer m mx () () () w h d w2 h2 d2 gst mod g
 reshape = Layer reshapeForward reshapeBackward reshapeAvg reshapeUpd reshapeInit
 
-reshapeInit :: (Monad m, RandomGen g) => (g -> (Double, g)) -> g -> m ((), g)
+reshapeInit :: (Monad m, RandomGen g) => WeightInitializer g -> g -> m ((), g)
 reshapeInit _ g = pure ((), g)

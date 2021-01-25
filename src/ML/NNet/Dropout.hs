@@ -10,6 +10,7 @@ import Data.BlasM
 import Data.Proxy
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 data DropoutSt mx w h d g = DropoutSt g Double (Matrix mx w h d)
@@ -30,15 +31,15 @@ dropoutAvg _ = pure ()
 -- (gconf -> lst -> gd -> m lst) ->
 dropoutUpd :: forall m mx g w h d conf. (BlasM m mx, RandomGen g, KnownNat w, KnownNat h, KnownNat d) => conf -> DropoutSt mx w h d g -> () -> m (DropoutSt mx w h d g)
 dropoutUpd _ (DropoutSt gen rate dmx) _ = do
-  (dmx1, gen') <- randomMx (randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
+  (dmx1, gen') <- randomMx (\_ _ -> randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
   dmx2 <- applyFunction dmx1 (If (IfLt Value (Const rate)) (Const 0) (Const 1))
   pure (DropoutSt gen' rate dmx2)
 
 dropout :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => g -> Double -> Layer m mx (DropoutSt mx w h d g) () () w h d w h d gconf mod g
 dropout gen rate = Layer dropoutF dropoutB dropoutAvg dropoutUpd (dropoutInit gen rate)
 
-dropoutInit :: forall w h d m mx g. (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => g -> Double -> (g -> (Double, g)) -> g -> m (DropoutSt mx w h d g, g)
+dropoutInit :: forall w h d m mx g. (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => g -> Double -> WeightInitializer g -> g -> m (DropoutSt mx w h d g, g)
 dropoutInit gen rate _ g = do
-  (dmx, gen') <- randomMx (randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
+  (dmx, gen') <- randomMx (\_ _ -> randomR (0.0, 1.0)) gen (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
   dmx' <- applyFunction dmx (If (IfLt Value (Const rate)) (Const 0) (Const 1))
   pure (DropoutSt gen' rate dmx', g)

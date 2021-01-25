@@ -10,6 +10,7 @@ import Data.Proxy
 import Debug.Trace
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 data ReluSt = ReluSt
@@ -42,5 +43,5 @@ reluU _ st _ = pure st
 relu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy w -> Proxy h -> Proxy d -> Layer m mx ReluSt (ReluIn mx w h d) ReluG w h d w h d conf mod g
 relu w h d = Layer reluForward reluBackward reluAvg reluU reluInit
 
-reluInit :: (RandomGen g, Monad m) => (g -> (Double, g)) -> g -> m (ReluSt, g)
+reluInit :: (RandomGen g, Monad m) => WeightInitializer g -> g -> m (ReluSt, g)
 reluInit _ gen = pure (ReluSt, gen)

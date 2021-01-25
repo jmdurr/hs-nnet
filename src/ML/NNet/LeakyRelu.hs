@@ -10,6 +10,7 @@ import Data.Proxy
 import Debug.Trace
 import GHC.TypeLits
 import ML.NNet
+import ML.NNet.Init.RandomFun
 import System.Random
 
 data LeakyReluSt = LeakyReluSt Double
@@ -46,6 +47,6 @@ defLeakyRelu w h d = Layer leakyReluForward leakyReluBackward leakyReluG leakyRe
 leakyRelu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Double -> Proxy w -> Proxy h -> Proxy d -> Layer m mx LeakyReluSt (LeakyReluIn mx w h d) LeakyReluG w h d w h d conf mod g
 leakyRelu sc w h d = Layer leakyReluForward leakyReluBackward leakyReluG leakyReluU (leakyReluInit sc)
 
-leakyReluInit :: (BlasM m mx, RandomGen g) => Double -> (g -> (Double, g)) -> g -> m (LeakyReluSt, g)
+leakyReluInit :: (BlasM m mx, RandomGen g) => Double -> WeightInitializer g -> g -> m (LeakyReluSt, g)
 leakyReluInit sc _ gen = do
   pure (LeakyReluSt sc, gen)
