@@ -23,7 +23,7 @@ spec =
       v <- withCLGpu (undefined :: Proxy CFloat) $ do
         (n, _) <- fullyConnectedSGDInit (Proxy :: Proxy 2) (Proxy :: Proxy 3) (\_ _ -> const (1.0, mkStdGen 2)) (mkStdGen 2)
         mxToLists (ffnB n)
-      v `shouldBe` [[[1], [1], [1]]]
+      v `shouldBe` [[[0], [0], [0]]]
 
 {-
     it "should feed forward" $ do

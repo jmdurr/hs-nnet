@@ -19,4 +19,4 @@ spec = do
         i <- mxFromList [0, 1, -1, 2, -2, 2, -3, 3] (Proxy :: Proxy 2) (Proxy :: Proxy 2) (Proxy :: Proxy 2)
         (mx, _) <- leakyReluForward (LeakyReluSt 0.02) i
         mxToLists mx
-      v `shouldBe` [[[0, 1], [-0.20000000298023224, 2]], [[-0.4000000059604645, 2], [-0.6000000238418579, 3]]]
+      v `shouldBe` [[[0, 1], [-1.9999999552965164e-2, 2]], [[-3.999999910593033e-2, 2], [-5.999999865889549e-2, 3]]]

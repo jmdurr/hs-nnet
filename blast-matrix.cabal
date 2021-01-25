@@ -17,14 +17,12 @@ cabal-version:       >=1.10
 library
   hs-source-dirs:      src
   exposed-modules:     Data.Matrix.OpenCL,
-                       -- Data.Matrix.CLBlast,
                        Data.Matrix.CLBlas,
                        Data.BlasM,
                        ML.NNet,
                        ML.NNet.FullyConnectedSGD,
                        ML.NNet.Relu,
                        ML.NNet.LeakyRelu,
-                       -- ML.NNet.Gelu,
                        ML.NNet.Reshape,
                        ML.NNet.Sigmoid,
                        ML.NNet.Init.RandomFun,
@@ -32,18 +30,15 @@ library
                        ML.NNet.Dropout,
                        ML.NNet.Convolve,
                        ML.NNet.Deconvolve,
-                       --ML.NNet.ClipGrad,
                        ML.NNet.LayerBias,
-
-                       --ML.NNet.GradientMod.LearningRate,
                        ML.NNet.GradientMod.RMSProp,
                        ML.NNet.GradientMod.Momentum,
                        ML.NNet.GradientMod.Adam,
                        ML.NNet.GradientMod.Rate,
                        ML.NNet.GradientMod.Demon,
                        ML.NNet.GradientMod.ClipWeights,
-
                        Data.Matrix.CLBlasM
+                       
   build-depends:       base,
                        mtl,
                        vector,
@@ -54,8 +49,8 @@ library
                        text,
                        language-c-quote,
                        mainland-pretty,
-                       normaldistribution
-                       --iee754
+                       normaldistribution,
+                       cereal
 
   default-language:    Haskell2010
   extra-libraries:     OpenCL,

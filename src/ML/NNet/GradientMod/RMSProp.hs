@@ -27,7 +27,7 @@ instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMeth
     vt <- case st of
       Nothing -> pure v2
       Just v1 -> do
-        v1' <- applyFunction v1 (Mul (Mul Value Value) (Const beta))
+        v1' <- applyFunction v1 (Mul Value (Const beta))
         add v1' v2
     dwt1 <- applyFunction vt (Div (Const (- rate)) (Sqrt (Add Value (Const nz))))
     dwt <- mult dwt1 grad
