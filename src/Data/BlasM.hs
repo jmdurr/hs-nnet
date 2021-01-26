@@ -15,7 +15,11 @@ module Data.BlasM where
 
 import Control.Monad (foldM)
 import Control.Monad.IO.Class (MonadIO, liftIO)
+import qualified Data.ByteString as BS
 import Data.Proxy
+import Data.Serialize
+import Data.Serialize.Get
+import Data.Serialize.Put
 import Data.Word (Word64)
 import Debug.Trace
 import Foreign.Storable
@@ -334,3 +338,31 @@ normalizeZeroUnitMxs mxs = do
 clampMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Double -> Double -> m (Matrix mx w h d)
 clampMx mx clampMin clampMax =
   applyFunction mx (Max (Const clampMin) (Min (Const clampMax) Value))
+
+serializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m BS.ByteString
+serializeMx mx = do
+  ls <- mxToLists mx
+  pure $
+    runPut $ do
+      putInt64le (fromIntegral $ natVal (Proxy :: Proxy w))
+      putInt64le (fromIntegral $ natVal (Proxy :: Proxy h))
+      putInt64le (fromIntegral $ natVal (Proxy :: Proxy d))
+      put (concat $ concat ls)
+
+deserializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => (Proxy '(w, h, d)) -> BS.ByteString -> m (Matrix mx w h d)
+deserializeMx _ bs = do
+  let v =
+        runGet
+          ( do
+              w <- getInt64le
+              h <- getInt64le
+              d <- getInt64le
+              ls <- get
+              if w /= (fromIntegral $ natVal (Proxy :: Proxy w)) || h /= (fromIntegral $ natVal (Proxy :: Proxy h)) || d /= (fromIntegral $ natVal (Proxy :: Proxy d))
+                then fail "Saved dimensions do not match specified dimensions"
+                else pure ls
+          )
+          bs
+  case v of
+    Left e -> fail e
+    Right r -> mxFromList r (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)

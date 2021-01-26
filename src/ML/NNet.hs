@@ -12,6 +12,7 @@ module ML.NNet where
 
 import Control.Monad.IO.Class
 import Data.BlasM
+import qualified Data.ByteString as BS
 import Data.Proxy
 import GHC.TypeLits
 import ML.NNet.Init.RandomFun
