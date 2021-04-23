@@ -7,11 +7,6 @@ module ML.NNet.GradientMod.Rate where
 import Data.BlasM
 import GHC.TypeLits
 import ML.NNet
-import ML.NNet.Convolve
-import ML.NNet.Deconvolve
-import ML.NNet.FullyConnectedSGD
-import ML.NNet.LeakyRelu
-import ML.NNet.Relu
 
 data Rate = Rate Double
 
@@ -24,3 +19,8 @@ instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMeth
     v <- scale grad (- rate)
     m <- add wgt v
     pure (m, ())
+  serializeMod _ =
+    (pure $ pure $ Just ()
+    ,const $ pure $ pure ()
+    )
+        

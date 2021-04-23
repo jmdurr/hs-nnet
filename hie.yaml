@@ -1,0 +1,8 @@
+cradle:
+  stack:
+    - path: "./src/"
+      component: "blast-matrix:lib"
+    - path: "./test"
+      component: "blast-matrix:test:spec"
+    - path: "./benchmarks"
+      component: "blast-matrix:bench:blast-matrix-benchmarks"

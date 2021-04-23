@@ -1,15 +1,23 @@
 module ML.NNet.Init.RandomFun where
 
 import Data.Random.Normal
-import Debug.Trace
 import System.Random
 
 type WeightInitializer g = Int -> Int -> (g -> (Double, g))
 
 kaimingWeights :: (RandomGen g) => WeightInitializer g
-kaimingWeights fanIn _ g =
-  let (r, g') = normalSg 0 1 g
-   in (r * (sqrt 2 / sqrt (fromIntegral fanIn)), g')
+kaimingWeights fanIn _ = normalSg 0 (sqrt (2 / fromIntegral fanIn))
+
+heUniformWeights :: (RandomGen g) => WeightInitializer g
+heUniformWeights fanIn _ = let val = sqrt (6 / fromIntegral fanIn) in randomR (negate val, val)
+
+kaimingWeightsSg :: (RandomGen g) => Double -> Double -> WeightInitializer g
+kaimingWeightsSg mu sigma fanIn _ g =
+  let (r, g') = normalSg mu sigma g
+   in (r * sqrt (2 / fromIntegral fanIn), g')
+
+glorotUniformWeights :: (RandomGen g) => WeightInitializer g
+glorotUniformWeights fanIn fanOut = let val = sqrt 3 * sqrt (6 / fromIntegral (fanIn + fanOut)) in randomR (negate val, val)
 
 normalSg :: (RandomGen g) => Double -> Double -> g -> (Double, g)
 normalSg mu sigma =

@@ -1,3 +1,4 @@
+
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -8,30 +9,30 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE PolyKinds #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE StandaloneDeriving #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE TypeOperators #-}
 
 module Data.BlasM where
 
-import Control.Monad (foldM)
-import Control.Monad.IO.Class (MonadIO, liftIO)
-import qualified Data.ByteString as BS
+import Control.DeepSeq
+import Control.Monad.IO.Class (MonadIO,liftIO)
 import Data.Proxy
 import Data.Serialize
-import Data.Serialize.Get
-import Data.Serialize.Put
-import Data.Word (Word64)
-import Debug.Trace
-import Foreign.Storable
+import Data.Vector.Serialize
 import GHC.Generics (Generic)
 import GHC.TypeLits
-import Text.Printf
+import qualified Data.Vector.Storable as V
+import Data.List (unfoldr)
 
 data Matrix mx w h d where
   Matrix :: (KnownNat w, KnownNat h, KnownNat d) => mx -> Matrix mx w h d
 
 instance (KnownNat w, KnownNat h, KnownNat d, Show mx) => Show (Matrix mx w h d) where
   show (Matrix mx) = "Matrix " <> show (natVal (undefined :: Proxy w), natVal (undefined :: Proxy h), natVal (undefined :: Proxy d)) <> " [" <> show mx <> "]"
+
+instance (NFData mx) => NFData (Matrix mx w h d) where
+  rnf (Matrix mx) = rnf mx
 
 mxWidth :: forall mx w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Int
 mxWidth _ = fromIntegral $ natVal (Proxy :: Proxy w)
@@ -61,7 +62,6 @@ data MxFunction
   | Add MxFunction MxFunction
   | Sub MxFunction MxFunction
   | Const Double
-  | Random Double Double
   | Min MxFunction MxFunction
   | Max MxFunction MxFunction
   | Sinh MxFunction
@@ -69,12 +69,11 @@ data MxFunction
   | Sqrt MxFunction
   | Tanh MxFunction
   | If IfExp MxFunction MxFunction
+  | Abs MxFunction
   deriving (Show, Eq, Generic)
 
--- | A class for something that provides a blas like interface
 class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
   nearZero :: m Double
-  dot :: (KnownNat h) => Vector mx h -> Vector mx h -> m Double
 
   -- (h,w) x (w,w1) = (h,w1)
   dense :: (KnownNat w, KnownNat h, KnownNat d, KnownNat w1) => Matrix mx w h d -> Matrix mx w1 w d -> m (Matrix mx w1 h d)
@@ -115,24 +114,48 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     (KnownNat w, KnownNat h, KnownNat d, KnownNat w2, KnownNat h2, KnownNat d2, KnownNat (w GHC.TypeLits.* h), KnownNat (w2 GHC.TypeLits.* h2), (w GHC.TypeLits.* h GHC.TypeLits.* d) ~ (w2 GHC.TypeLits.* h2 GHC.TypeLits.* d2)) =>
     Matrix mx w h d ->
     m (Matrix mx w2 h2 d2)
-  mxFromList ::
+  mxFromVec ::
     (KnownNat w, KnownNat h, KnownNat d) =>
-    [Double] ->
+    V.Vector Double ->
     Proxy w ->
     Proxy h ->
     Proxy d ->
     m (Matrix mx w h d)
-  mxToLists ::
+    
+  mxToLists :: forall w h d.
     (KnownNat w, KnownNat h, KnownNat d) =>
     Matrix mx w h d ->
     m [[[Double]]]
+  mxToLists mx =
+    do v <- mxToVec mx
+       let layers = chunk v (w * h)
+       pure $ map (\l -> map V.toList (chunk l w)) layers
+    where chunk vec n = unfoldr (\v' ->
+                            if V.null v'
+                            then Nothing
+                            else let (v1,vr) = V.splitAt n v' in
+                                   Just (v1, vr)
+                         ) vec
+          w = (fromIntegral $ natVal (Proxy :: Proxy w)) :: Int
+          h = (fromIntegral $ natVal (Proxy :: Proxy h)) :: Int
+
+  mxToVec :: (KnownNat w, KnownNat h, KnownNat d) =>
+    Matrix mx w h d ->
+    m (V.Vector Double)
+
+  showFirst :: (KnownNat w, KnownNat h, KnownNat d) =>
+    Matrix mx w h d ->
+    m ()
+  showFirst mx = do
+    v <- mxToVec mx
+    liftIO $ print (V.head v, V.last v)
 
   -- TODO flipping does not always equal the same w h d, need to split this into flipH flipV flipBoth
   flip :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> FlipAxis -> m (Matrix mx w h d)
 
   addToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
   multToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
-  sumFlatten :: forall w h d nd. (KnownNat w, KnownNat h, KnownNat d, KnownNat nd) => Matrix mx w h d -> Proxy nd -> m (Matrix mx w h nd)
+
 
   sumLayers :: forall w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m (Matrix mx 1 1 d)
 
@@ -182,8 +205,6 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     (Proxy dx, Proxy dy) ->
     -- | dialation of the filter
     (Proxy dfx, Proxy dfy) ->
-    -- | should flip filter on both x and y axis
-    Bool ->
     m (Matrix mx ow oh fd)
 
   {-
@@ -229,8 +250,6 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     (Proxy dx, Proxy dy) ->
     -- | dialation of the filter
     (Proxy dfx, Proxy dfy) ->
-    -- | should flip filter on both x and y axis
-    Bool ->
     m (Matrix mx ow oh (d GHC.TypeLits.* fd))
 
   {-
@@ -274,8 +293,6 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     (Proxy dx, Proxy dy) ->
     -- | dialation of the filter
     (Proxy dfx, Proxy dfy) ->
-    -- | should flip filter on both x and y axis
-    Bool ->
     m (Matrix mx ow oh (Div fd d))
 
 -- TODO add a requirement that the filter center is always over the input matrix (not over the padding)
@@ -289,12 +306,12 @@ varMxs mxs =
    in do
         -- sum layers, divide by (# matrices
         avg <- avgMxs mxs
-        v1 <- mapM (`applyFunction` (Exp (Sub Value (Const avg)) (Const 2.0))) mxs
+        v1 <- mapM (`applyFunction` Exp (Sub Value (Const avg)) (Const 2.0)) mxs
         top1 <- mapM sumLayers v1
         top2 <- mapM mxToLists top1
 
         let top = sum $ concat $ concat $ concat top2
-        pure (top / (fromIntegral $ numCells * len - 1))
+        pure (top / fromIntegral (numCells * len - 1))
 
 cellAvgMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m (Matrix mx w h d)
 cellAvgMxs [] = error "cannot average empty list"
@@ -309,11 +326,10 @@ cellAvgMxs (v : vs) = go v vs
 avgMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => [Matrix mx w h d] -> m Double
 avgMxs [] = error "Cannot average 0 matrices"
 avgMxs mxs = do
-  cavg <- cellAvgMxs mxs -- one matrix w h d
-  ls <- sumLayers cavg -- one matrix 1 1 d (divide by w*h to get average) -- mxToLists = [ [ [1] ],[ [ [2] ] ] ]
-  ttl <- (sum . concat . concat) <$> mxToLists ls
-  -- divide by total size
-  pure (ttl / (fromIntegral $ mxWidth (head mxs) * mxHeight (head mxs) * mxDepth (head mxs)))
+  cavg <- cellAvgMxs mxs
+  ls <- sumLayers cavg
+  ttl <- sum . concat . concat <$> mxToLists ls
+  pure (ttl / fromIntegral (mxWidth (head mxs) * mxHeight (head mxs) * mxDepth (head mxs)))
 
 foldM' :: (Monad m) => (a -> b -> m a) -> a -> [b] -> m a
 foldM' _ z [] = return z
@@ -325,44 +341,60 @@ normalizeMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, MonadFail m) =>
 normalizeMxs [] = fail "Cannot normalize 0 matrices"
 normalizeMxs mxs = do
   -- find max and min value
-  (minVal, maxVal) <- foldM' (\(!mini, !maxi) mx -> ((concat . concat) <$> mxToLists mx) >>= \ls -> pure (min mini (minimum ls), max maxi (maximum ls))) (1 / 0, (-1 / 0)) mxs
+  (minVal, maxVal) <- foldM' (\(!mini, !maxi) mx -> mxToLists mx >>= (\ls -> pure (min mini (minimum ls), max maxi (maximum ls))) . concat . concat) (1 / 0, negate 1 / 0) mxs
   foldM' (\mxs' mx -> applyFunction mx (Div (Sub Value (Const minVal)) (Sub (Const maxVal) (Const minVal))) >>= \mx' -> pure (mxs' ++ [mx'])) [] mxs
+
+pnormalizeMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, MonadFail m) => Matrix mx w h d -> Double -> m Double
+pnormalizeMx mx p = do
+  mx' <- applyFunction mx (Exp (Abs Value) (Const p))
+  sx <- sumLayers mx'
+  ls <- mxToLists sx -- [[a],[b]]
+  let sm = sum (concat (concat ls))
+  pure (sm ** (1 / p))
 
 normalizeZeroUnitMxs :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, MonadFail m) => [Matrix mx w h d] -> m [Matrix mx w h d]
 normalizeZeroUnitMxs mxs = do
   avg <- avgMxs mxs
   var <- varMxs mxs
   let sd = sqrt var
-  mapM (`applyFunction` (Div (Sub Value (Const avg)) (Const sd))) mxs
+  mapM (`applyFunction` Div (Sub Value (Const avg)) (Const (if sd == 0 then 1e-6 else sd))) mxs
 
 clampMx :: (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Double -> Double -> m (Matrix mx w h d)
 clampMx mx clampMin clampMax =
   applyFunction mx (Max (Const clampMin) (Min (Const clampMax) Value))
 
-serializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m BS.ByteString
+serializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m Put
 serializeMx mx = do
-  ls <- mxToLists mx
-  pure $
-    runPut $ do
-      putInt64le (fromIntegral $ natVal (Proxy :: Proxy w))
-      putInt64le (fromIntegral $ natVal (Proxy :: Proxy h))
-      putInt64le (fromIntegral $ natVal (Proxy :: Proxy d))
-      put (concat $ concat ls)
+  ls <- mxToVec mx
+  pure $ do
+    putInt64le (fromIntegral $ natVal (Proxy :: Proxy w))
+    putInt64le (fromIntegral $ natVal (Proxy :: Proxy h))
+    putInt64le (fromIntegral $ natVal (Proxy :: Proxy d))
+    genericPutVector ls
+    
+maybeSerializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Maybe (Matrix mx w h d) -> m Put
+maybeSerializeMx Nothing = pure (putWord8 0)
+maybeSerializeMx (Just mx) = do
+  p1 <- serializeMx mx
+  pure (putWord8 1 >> p1)
 
-deserializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => (Proxy '(w, h, d)) -> BS.ByteString -> m (Matrix mx w h d)
-deserializeMx _ bs = do
-  let v =
-        runGet
-          ( do
-              w <- getInt64le
-              h <- getInt64le
-              d <- getInt64le
-              ls <- get
-              if w /= (fromIntegral $ natVal (Proxy :: Proxy w)) || h /= (fromIntegral $ natVal (Proxy :: Proxy h)) || d /= (fromIntegral $ natVal (Proxy :: Proxy d))
-                then fail "Saved dimensions do not match specified dimensions"
-                else pure ls
-          )
-          bs
-  case v of
-    Left e -> fail e
-    Right r -> mxFromList r (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d)
+deserializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Proxy '(w, h, d) -> Get (m (Matrix mx w h d))
+deserializeMx _ =
+  do
+    w <- getInt64le
+    h <- getInt64le
+    d <- getInt64le
+    ls <- genericGetVector
+    if w /= fromIntegral (natVal (Proxy :: Proxy w)) || h /= fromIntegral (natVal (Proxy :: Proxy h)) || d /= fromIntegral (natVal (Proxy :: Proxy d))
+      then fail "Saved dimensions do not match specified dimensions"
+      else pure (mxFromVec ls (Proxy :: Proxy w) (Proxy :: Proxy h) (Proxy :: Proxy d))
+
+maybeDeserializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Proxy '(w, h, d) -> Get (m (Maybe (Matrix mx w h d)))
+maybeDeserializeMx px =
+  do
+    e <- getWord8
+    case e of
+      0 -> pure (pure Nothing)
+      _ -> do
+        v <- deserializeMx px
+        pure (Just <$> v)

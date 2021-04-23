@@ -9,15 +9,17 @@
 
 module ML.NNet.Convolve where
 
-import Control.Monad.IO.Class
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
 import Data.BlasM
 import Data.Proxy
-import Debug.Trace
+import Data.Serialize
 import GHC.TypeLits
 import ML.NNet
 import ML.NNet.Init.RandomFun
 import ML.NNet.LayerBias
 import System.Random
+import Text.Printf
 
 {-
 A filter must always have the same # of layers as input channels
@@ -28,11 +30,32 @@ This results in a single feature map per filter or 1 output layer per filter
 
 -}
 
-data ConvolveSt mx fw fh fd id gst = ConvolveSt (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Maybe gst)
+data ConvolveSt mx fw fh fd id gst = ConvolveSt (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Maybe gst)
 
 type ConvolveIn mx iw ih id = Matrix mx iw ih id
 
 type ConvolveG mx fw fh fd id = Matrix mx fw fh (id GHC.TypeLits.* fd)
+
+-- layerbias is connected with convolve
+conSerialize ::
+  forall m mx fw fh fd conf id gst.
+  (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, GradientDescentMethod m mx conf gst fw fh (id GHC.TypeLits.* fd)) =>
+  conf ->
+  (Get (m (ConvolveSt mx fw fh fd id gst)), ConvolveSt mx fw fh fd id gst -> m Put)
+conSerialize _ =
+  ( do
+      getmx <- deserializeMx (Proxy :: Proxy '(fw, fh, id GHC.TypeLits.* fd))
+      getst <- fst $ serializeMod (Proxy :: Proxy '(conf, fw, fh, id GHC.TypeLits.* fd))
+      pure $ do
+        mx <- getmx
+        st <- getst
+        fmx <- Data.BlasM.flip mx FlipBoth
+        pure (ConvolveSt mx fmx st),
+    \(ConvolveSt mx _ cnf) -> do
+      putmx <- serializeMx mx
+      putst <- (snd $ serializeMod (Proxy :: Proxy '(conf, fw, fh, id GHC.TypeLits.* fd))) cnf
+      pure $ putmx >> putst
+  )
 
 conForward ::
   forall m mx wi hi di fw fh fd wo ho pyt pyb pxl pxr sy sx gst.
@@ -66,9 +89,9 @@ conForward ::
   ConvolveSt mx fw fh fd di gst ->
   Matrix mx wi hi di ->
   m (Matrix mx wo ho fd, ConvolveIn mx wi hi di)
-conForward ps pp (ConvolveSt flt _) inmx = do
+conForward _ _ (ConvolveSt flt _ _) inmx = do
   -- inmx == di, filterd = fd
-  r <- Data.BlasM.convolve inmx flt (Proxy :: Proxy fd) (Proxy :: Proxy sx, Proxy :: Proxy sy) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy 0, Proxy :: Proxy 0) False
+  r <- Data.BlasM.convolve inmx flt (Proxy :: Proxy fd) (Proxy :: Proxy sx, Proxy :: Proxy sy) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy 0, Proxy :: Proxy 0)
   -- r' <- add r (cFilterBiases con) -- each filter layer has 1 bias so just need to add it to every output at each depth
   -- need to add each bias in each layer to each layer of output...
   -- r' <- addToAllWithDepth r (cFilterBiases con)
@@ -123,24 +146,42 @@ conBackward ::
   ConvolveIn mx wi hi di ->
   Matrix mx wo ho fd ->
   m (Matrix mx wi hi di, ConvolveG mx fw fh fd di)
-conBackward ps pp (ConvolveSt wgt _) oldIn dy = do
+conBackward _ _ (ConvolveSt wgt fwgt _) oldIn dy = do
   -- dy is fd deep
   -- w is fd * id deep
+  -- dy conv wgt = fd  (fd,id) -> id deep
+  -- difference is in order of layers, in 1,2,3 -> fd 1 2 3 -> out 1,   out 1 fd 1 2 3 -> in 1 (which is wrong)+-
   -- dx is id deep
-  dLdX <- Data.BlasM.convolveLayersDy dy wgt (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0) True
+  dLdX <- Data.BlasM.convolveLayersDy dy fwgt (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0)
   -- rotate kernel, convolve with dy, multiply y
   -- dy has same # of layers as x but we need to output x * fd layers
-  dLdF <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) False
+  -- gradient weights = convolve input with output
+  {-
+    dyval <- avgMxs [dLdX]
+    when (dyval > 10) $ do
+      wgts <- mxToCSV fwgt
+      outval <- mxToCSV dLdX
+      liftIO $ printf "convolve status:\n--flipweights--\n%s\n--fromsig--\n%s\n--outval--\n%s\n" wgts fromsig outval
+      fail "oops"
+  -}
+  dLdF <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1))
+  -- convolve dy with oldin
 
+  -- dy, gradient weights
   pure (dLdX, dLdF)
 
-conAvg :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, id) -> [ConvolveG mx fw fh fd id] -> m (ConvolveG mx fw fh fd id)
-conAvg _ gds = cellAvgMxs gds
+conAvg :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, id) -> (ConvolveG mx fw fh fd id -> ConvolveG mx fw fh fd id -> m (ConvolveG mx fw fh fd id), ConvolveG mx fw fh fd id -> Int -> m (ConvolveG mx fw fh fd id))
+conAvg _ =
+  (add, \gd i -> scale gd (1.0 / fromIntegral i))
 
 conUpd :: forall m mx fw fh fd id gconf gst. (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, KnownNat (id GHC.TypeLits.* fd), GradientDescentMethod m mx gconf gst fw fh (id GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, id) -> gconf -> ConvolveSt mx fw fh fd id gst -> ConvolveG mx fw fh fd id -> m (ConvolveSt mx fw fh fd id gst)
-conUpd _ gconf (ConvolveSt wgt gst) dw = do
+conUpd _ gconf (ConvolveSt wgt _ gst) dw = do
   (wgt', gst') <- updateWeights gconf gst wgt dw
-  pure (ConvolveSt wgt' (Just gst'))
+  -- dwgt <- avgMxs [wgt]
+  -- dwgt' <- avgMxs [wgt']
+  --liftIO $ putStrLn $ "updated conv weights from " <> show dwgt <> " to " <> show dwgt'
+  fwgt <- Data.BlasM.flip wgt' FlipBoth
+  pure (ConvolveSt wgt' fwgt (Just gst'))
 
 conInit ::
   forall g m mx dpo fw fh di gst.
@@ -150,12 +191,13 @@ conInit ::
   g ->
   m (ConvolveSt mx fw fh dpo di gst, g)
 conInit _ rf gen =
-  let (filt, gen1) = netRandoms rf gen (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh) * natVal (Proxy :: Proxy (di GHC.TypeLits.* dpo))) fin fout
-      fin = (fromIntegral $ natVal (Proxy :: Proxy di) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
-      fout = (fromIntegral $ natVal (Proxy :: Proxy dpo) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
+  let fm = (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
+      fin = (fromIntegral $ natVal (Proxy :: Proxy di)) * fm
+      fout = (fromIntegral $ natVal (Proxy :: Proxy dpo)) * fm
    in do
-        fmx <- mxFromList filt (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* dpo))
-        pure $ (ConvolveSt fmx Nothing, gen1)
+        (fmx, gen1) <- randomMx rf gen (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* dpo)) fin fout
+        fwgt <- Data.BlasM.flip fmx FlipBoth
+        pure (ConvolveSt fmx fwgt Nothing, gen1)
 
 convolve ::
   forall m mx wi hi di wo ho g fw fh fd sx sy pxl pxr pyt pyb gconf gst gbst.
@@ -211,6 +253,6 @@ convolve ::
   Proxy '(pxl, pxr, pyt, pyb) ->
   -- | filter depth is dpo / di
   Layer m mx (ConvolveSt mx fw fh fd di gst, LayerBiasSt mx fd gbst) (ConvolveIn mx wi hi di, ()) (ConvolveG mx fw fh fd di, Matrix mx 1 1 fd) wi hi di wo ho fd gconf (gst, gbst) g
-convolve pxf pxs pxp =
+convolve _ pxs pxp =
   let px = Proxy :: Proxy '(fw, fh, fd, di)
-   in (Layer (conForward pxs pxp) (conBackward pxs pxp) (conAvg px) (conUpd px) (conInit px)) `connect` layerBias (Proxy :: Proxy '(wo, ho, fd))
+   in (Layer (conForward pxs pxp) (conBackward pxs pxp) (conAvg px) (conUpd px) (conInit px) conSerialize) `connect` layerBias (Proxy :: Proxy '(wo, ho, fd))

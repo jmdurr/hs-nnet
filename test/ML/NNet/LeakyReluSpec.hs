@@ -9,7 +9,8 @@ import Foreign.C.Types
 import ML.NNet.LeakyRelu
 import System.Random
 import Test.Hspec
-
+import qualified Data.Vector.Storable as V
+mxFromList ls px py pz = mxFromVec (V.fromList ls) px py pz
 -- this should learn to detect a circle
 spec :: Spec
 spec = do

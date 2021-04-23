@@ -1,17 +1,13 @@
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
-
+{-# LANGUAGE ScopedTypeVariables #-}
 module ML.NNet.GradientMod.Momentum where
 
 import Data.BlasM
 import GHC.TypeLits
 import ML.NNet
-import ML.NNet.Convolve
-import ML.NNet.Deconvolve
-import ML.NNet.FullyConnectedSGD
-import ML.NNet.LeakyRelu
-import ML.NNet.Relu
+import Data.Proxy
 
 data Momentum = Momentum Double Double
 
@@ -32,3 +28,7 @@ instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMeth
     vo4 <- scale vo3 (- rate)
     wgt' <- add wgt vo4
     pure (wgt', vo3)
+  serializeMod _ =
+    ( maybeDeserializeMx (Proxy :: Proxy '(w,h,d))
+    , maybeSerializeMx
+    )

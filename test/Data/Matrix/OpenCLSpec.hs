@@ -21,5 +21,6 @@ spec = do
         n <- clGetPlatforms
         d <- clGetDevices (head n)
         di <- mapM clDeviceInfo d
+        print di
         length di `shouldSatisfy` (> 0)
         length (clDeviceInfoName (head di)) `shouldSatisfy` (> 0)

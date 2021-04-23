@@ -27,7 +27,7 @@ type NormIn mx w h d =
 type NormG mx d =
   NormG
     { normGradGamma :: Vector mx 1 1 d
-    , normGradInMean :: Matrix mx 1 1 d,
+    , normGradInMean :: Matrix mx 1 1 d
     , normGradInVar :: Matrix mx 1 1 d
     }
 

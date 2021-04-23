@@ -7,7 +7,7 @@ module ML.NNet.LeakyRelu where
 
 import Data.BlasM
 import Data.Proxy
-import Debug.Trace
+import Data.Serialize
 import GHC.TypeLits
 import ML.NNet
 import ML.NNet.Init.RandomFun
@@ -18,6 +18,15 @@ data LeakyReluSt = LeakyReluSt Double
 type LeakyReluIn mx w h d = Matrix mx w h d
 
 data LeakyReluG = LeakyReluG
+
+leakyReluSerialize :: Monad m => conf -> (Get (m LeakyReluSt), LeakyReluSt -> m Put)
+leakyReluSerialize _ =
+  ( do
+      r <- getFloat64be
+      pure (pure (LeakyReluSt r)),
+    \(LeakyReluSt r) -> do
+      pure $ putFloat64be r
+  )
 
 leakyReluForward :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx) => LeakyReluSt -> Matrix mx w h d -> m (Matrix mx w h d, LeakyReluIn mx w h d)
 leakyReluForward (LeakyReluSt sc) mx = do
@@ -35,17 +44,17 @@ leakyReluBackward (LeakyReluSt sc) inp mx = do
   -- multiply 1 for 1 with mx
   pure (v', LeakyReluG)
 
-leakyReluG :: Monad m => [LeakyReluG] -> m LeakyReluG
-leakyReluG _ = pure LeakyReluG
+leakyReluG :: Monad m => (LeakyReluG -> LeakyReluG -> m LeakyReluG, LeakyReluG -> Int -> m LeakyReluG)
+leakyReluG = (const (const (pure LeakyReluG)), const (const (pure LeakyReluG)))
 
 leakyReluU :: (Monad m) => conf -> LeakyReluSt -> LeakyReluG -> m LeakyReluSt
 leakyReluU _ st _ = pure st
 
 defLeakyRelu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy w -> Proxy h -> Proxy d -> Layer m mx LeakyReluSt (LeakyReluIn mx w h d) LeakyReluG w h d w h d conf mod g
-defLeakyRelu w h d = Layer leakyReluForward leakyReluBackward leakyReluG leakyReluU (leakyReluInit 0.02)
+defLeakyRelu _ _ _ = Layer leakyReluForward leakyReluBackward leakyReluG leakyReluU (leakyReluInit 0.02) leakyReluSerialize
 
 leakyRelu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Double -> Proxy w -> Proxy h -> Proxy d -> Layer m mx LeakyReluSt (LeakyReluIn mx w h d) LeakyReluG w h d w h d conf mod g
-leakyRelu sc w h d = Layer leakyReluForward leakyReluBackward leakyReluG leakyReluU (leakyReluInit sc)
+leakyRelu sc _ _ _ = Layer leakyReluForward leakyReluBackward leakyReluG leakyReluU (leakyReluInit sc) leakyReluSerialize
 
 leakyReluInit :: (BlasM m mx, RandomGen g) => Double -> WeightInitializer g -> g -> m (LeakyReluSt, g)
 leakyReluInit sc _ gen = do

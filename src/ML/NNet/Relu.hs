@@ -2,12 +2,13 @@
 {-# LANGUAGE FlexibleContexts #-}
 {-# LANGUAGE RankNTypes #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE TupleSections #-}
 
 module ML.NNet.Relu where
 
 import Data.BlasM
 import Data.Proxy
-import Debug.Trace
+import Data.Serialize
 import GHC.TypeLits
 import ML.NNet
 import ML.NNet.Init.RandomFun
@@ -18,6 +19,12 @@ data ReluSt = ReluSt
 type ReluIn mx w h d = Matrix mx w h d
 
 data ReluG = ReluG
+
+reluSerialize :: Monad m => conf -> (Get (m ReluSt), ReluSt -> m Put)
+reluSerialize _ =
+  ( pure $ pure ReluSt,
+    \_ -> pure $ pure ()
+  )
 
 reluForward :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx) => ReluSt -> Matrix mx w h d -> m (Matrix mx w h d, ReluIn mx w h d)
 reluForward _ mx = do
@@ -34,14 +41,14 @@ reluBackward _ oldIn mx = do
   dy <- mult v' mx
   pure (dy, ReluG)
 
-reluAvg :: Monad m => [ReluG] -> m ReluG
-reluAvg _ = pure ReluG
+reluAvg :: Monad m => (ReluG -> ReluG -> m ReluG, ReluG -> Int -> m ReluG)
+reluAvg = (const (const (pure ReluG)), const (const (pure ReluG)))
 
 reluU :: (Monad m) => conf -> ReluSt -> ReluG -> m ReluSt
 reluU _ st _ = pure st
 
 relu :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx, RandomGen g) => Proxy w -> Proxy h -> Proxy d -> Layer m mx ReluSt (ReluIn mx w h d) ReluG w h d w h d conf mod g
-relu w h d = Layer reluForward reluBackward reluAvg reluU reluInit
+relu _ _ _ = Layer reluForward reluBackward reluAvg reluU reluInit reluSerialize
 
 reluInit :: (RandomGen g, Monad m) => WeightInitializer g -> g -> m (ReluSt, g)
 reluInit _ gen = pure (ReluSt, gen)

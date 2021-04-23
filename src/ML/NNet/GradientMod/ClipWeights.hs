@@ -2,17 +2,13 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE UndecidableInstances #-}
-
+{-# LANGUAGE ScopedTypeVariables #-}
 module ML.NNet.GradientMod.ClipWeights where
 
 import Data.BlasM
 import GHC.TypeLits
 import ML.NNet
-import ML.NNet.Convolve
-import ML.NNet.Deconvolve
-import ML.NNet.FullyConnectedSGD
-import ML.NNet.LeakyRelu
-import ML.NNet.Relu
+import Data.Proxy
 
 -- Number of total iterations and underlying algorithm
 data ClipWeights gc = ClipWeights Double Double gc
@@ -30,3 +26,12 @@ instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d, GradientDescentMethod 
     (wgt', gm') <- updateWeights gc Nothing wgt grad
     clp <- applyFunction wgt' (Max (Const mini) (Min (Const maxi) Value))
     pure (clp, ClipWeightsSt gm')
+  serializeMod _ =
+    (do
+        gst <- fst (serializeMod (Proxy :: Proxy '(gc,w,h,d)))
+        pure (gst >>= \mg -> case mg of
+                 Nothing -> pure Nothing
+                 Just mg' -> pure (Just (ClipWeightsSt mg'))
+             )
+    ,\mst -> (snd (serializeMod (Proxy :: Proxy '(gc,w,h,d)))) (fmap (\(ClipWeightsSt v) -> v) mst)
+    )

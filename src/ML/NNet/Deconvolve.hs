@@ -12,20 +12,43 @@ Deconvolution is a convolution with dialated input
 -}
 module ML.NNet.Deconvolve where
 
+import Control.Monad (when)
+import Control.Monad.IO.Class (liftIO)
 import Data.BlasM
 import Data.Proxy
-import Debug.Trace
+import Data.Serialize
 import GHC.TypeLits
 import ML.NNet
 import ML.NNet.Init.RandomFun
 import ML.NNet.LayerBias
-import System.Random
+import System.Random (RandomGen)
+import Text.Printf
 
-data DeconvolveSt mx fw fh fd id conf = DeconvolveSt (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Maybe conf)
+data DeconvolveSt mx fw fh fd id conf = DeconvolveSt (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Matrix mx fw fh (id GHC.TypeLits.* fd)) (Maybe conf)
 
 type DeconvolveIn mx iw ih id = Matrix mx iw ih id
 
 type DeconvolveG mx fw fh fd id = Matrix mx fw fh (id GHC.TypeLits.* fd)
+
+deconSerialize ::
+  forall m mx fw fh fd conf id gst.
+  (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat id, GradientDescentMethod m mx conf gst fw fh (id GHC.TypeLits.* fd)) =>
+  conf ->
+  (Get (m (DeconvolveSt mx fw fh fd id gst)), DeconvolveSt mx fw fh fd id gst -> m Put)
+deconSerialize _ =
+  ( do
+      getmx <- deserializeMx (Proxy :: Proxy '(fw, fh, id GHC.TypeLits.* fd))
+      getst <- fst $ serializeMod (Proxy :: Proxy '(conf, fw, fh, id GHC.TypeLits.* fd))
+      pure $ do
+        mx <- getmx
+        st <- getst
+        fmx <- Data.BlasM.flip mx FlipBoth
+        pure (DeconvolveSt mx fmx st),
+    \(DeconvolveSt mx _ cnf) -> do
+      putmx <- serializeMx mx
+      putst <- (snd $ serializeMod (Proxy :: Proxy '(conf, fw, fh, id GHC.TypeLits.* fd))) cnf
+      pure $ putmx >> putst
+  )
 
 deconForward ::
   forall m mx wi hi di fw fh fd wo ho pyt pyb pxl pxr sy sx conf.
@@ -61,9 +84,9 @@ deconForward ::
   DeconvolveSt mx fw fh fd di conf ->
   Matrix mx wi hi di ->
   m (Matrix mx wo ho fd, DeconvolveIn mx wi hi di)
-deconForward ps pp (DeconvolveSt wgt _) inmx = do
+deconForward _ _ (DeconvolveSt wgt _ _) inmx = do
   -- filter is smaller than input
-  r <- Data.BlasM.convolve inmx wgt (Proxy :: Proxy fd) (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0) False
+  r <- Data.BlasM.convolve inmx wgt (Proxy :: Proxy fd) (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0)
   -- r' <- add r (cFilterBiases con) -- each filter layer has 1 bias so just need to add it to every output at each depth
   -- need to add each bias in each layer to each layer of output...
   --r' <- addToAllWithDepth r (cFilterBiases con)
@@ -118,43 +141,67 @@ deconBackward ::
   DeconvolveIn mx wi hi di ->
   Matrix mx wo ho fd ->
   m (Matrix mx wi hi di, DeconvolveG mx fw fh fd di)
-deconBackward ps pp (DeconvolveSt wgt _) oldIn dy = do
+deconBackward _ _ (DeconvolveSt _ fwgt _) oldIn dy = do
   -- for deconvolution might need to take dialation into account for both forward and backward prop
-  dLdX <- Data.BlasM.convolveLayersDy dy wgt (Proxy :: Proxy sx, Proxy :: Proxy sy) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy 0, Proxy :: Proxy 0) True
-  dLdW <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0) False
+  --  avgdyin <- avgMxs [dy]
+  --  avgin <- avgMxs [oldIn]
+  --  avgwgt <- avgMxs [fwgt]
+  --  liftIO $ printf "deconvolvedy fw %d fh %d fd %d di %d wi %d hi %d\n" (natVal (Proxy :: Proxy fw)) (natVal (Proxy :: Proxy fh)) (natVal (Proxy :: Proxy fd)) (natVal (Proxy :: Proxy di)) (natVal (Proxy :: Proxy wi)) (natVal (Proxy :: Proxy hi))
+  dLdX <- Data.BlasM.convolveLayersDy dy fwgt (Proxy :: Proxy sx, Proxy :: Proxy sy) (Proxy :: Proxy (fw - 1 - pxl), Proxy :: Proxy (fw - 1 - pxr), Proxy :: Proxy (fh - 1 - pyt), Proxy :: Proxy (fh - 1 - pyb)) (Proxy :: Proxy 0, Proxy :: Proxy 0) (Proxy :: Proxy 0, Proxy :: Proxy 0)
+  --  liftIO $ printf "deconvolvelayer fw %d fh %d fd %d di %d wi %d hi %d\n" (natVal (Proxy :: Proxy fw)) (natVal (Proxy :: Proxy fh)) (natVal (Proxy :: Proxy fd)) (natVal (Proxy :: Proxy di)) (natVal (Proxy :: Proxy wi)) (natVal (Proxy :: Proxy hi))
+  dLdW <- Data.BlasM.convolveLayers oldIn dy (Proxy :: Proxy 1, Proxy :: Proxy 1) (Proxy :: Proxy pxl, Proxy :: Proxy pxr, Proxy :: Proxy pyt, Proxy :: Proxy pyb) (Proxy :: Proxy (sx - 1), Proxy :: Proxy (sy - 1)) (Proxy :: Proxy 0, Proxy :: Proxy 0)
+  --  liftIO $ printf "deconvolvedone fw %d fh %d fd %d di %d wi %d hi %d\n" (natVal (Proxy :: Proxy fw)) (natVal (Proxy :: Proxy fh)) (natVal (Proxy :: Proxy fd)) (natVal (Proxy :: Proxy di)) (natVal (Proxy :: Proxy wi)) (natVal (Proxy :: Proxy hi))
+  {-
+    dwout <- avgMxs [dLdW]
+    dxout <- avgMxs [dLdX]
+    when (avgdyin + avgin + avgwgt + dwout + dxout > 10000 || avgdyin + avgin + avgwgt + dwout + dxout < -10000) $ do
+      wgts <- mxToCSV fwgt
+      fromsig <- mxToCSV dy
+      outval <- mxToCSV dLdX
+      liftIO $ printf "deconvolve vals dyin %.2f in %.2f wgt %.2f dwout %.2f dxout %.2f\n" avgdyin avgin avgwgt dwout dxout
+      liftIO $ printf "deconvolve status:\n--flipweights--\n%s\n--fromsig--\n%s\n--outval--\n%s\n" wgts fromsig outval
+      fail "oops"
+  -}
   pure (dLdX, dLdW)
 
-deconAvg :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat di, KnownNat (di GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, di) -> [DeconvolveG mx fw fh fd di] -> m (DeconvolveG mx fw fh fd di)
-deconAvg _ = cellAvgMxs
+deconAvg :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat di, KnownNat (di GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, di) -> (DeconvolveG mx fw fh fd di -> DeconvolveG mx fw fh fd di -> m (DeconvolveG mx fw fh fd di), DeconvolveG mx fw fh fd di -> Int -> m (DeconvolveG mx fw fh fd di))
+deconAvg _ = (add, \gd i -> scale gd (1.0 / fromIntegral i))
 
 deconUpd :: (BlasM m mx, KnownNat fw, KnownNat fh, KnownNat fd, KnownNat di, KnownNat (di GHC.TypeLits.* fd), GradientDescentMethod m mx conf gst fw fh (di GHC.TypeLits.* fd)) => Proxy '(fw, fh, fd, di) -> conf -> DeconvolveSt mx fw fh fd di gst -> DeconvolveG mx fw fh fd di -> m (DeconvolveSt mx fw fh fd di gst)
-deconUpd _ conf (DeconvolveSt wgt gst) dw = do
+deconUpd _ conf (DeconvolveSt wgt _ gst) dw = do
   (wgt', gst') <- updateWeights conf gst wgt dw
-  pure (DeconvolveSt wgt' (Just gst'))
+  fwgt <- Data.BlasM.flip wgt' FlipBoth
+  pure (DeconvolveSt wgt' fwgt (Just gst'))
 
 deconInit ::
-  forall g m mx fw fh fd di gst.
+  forall g m mx fw fh fd di gst dx dy.
   ( RandomGen g,
     BlasM m mx,
     KnownNat fd,
     KnownNat fw,
     KnownNat fh,
     KnownNat di,
+    KnownNat dx,
+    KnownNat dy,
     Mod (di GHC.TypeLits.* fd) fd ~ 0,
     Div (di GHC.TypeLits.* fd) fd ~ di,
     KnownNat (di GHC.TypeLits.* fd)
   ) =>
-  Proxy '(fw, fh, fd, di) ->
+  Proxy '(fw, fh, fd, di, dx, dy) ->
   WeightInitializer g ->
   g ->
   m (DeconvolveSt mx fw fh fd di gst, g)
 deconInit _ rf gen =
-  let (filt, gen1) = netRandoms rf gen (fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh) * natVal (Proxy :: Proxy (di GHC.TypeLits.* fd))) fin fout
-      fin = (fromIntegral $ natVal (Proxy :: Proxy di) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
-      fout = (fromIntegral $ natVal (Proxy :: Proxy fd) * natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh))
+  let dialateInX = natVal (Proxy :: Proxy dx)
+      dialateInY = natVal (Proxy :: Proxy dy)
+      fm = fromIntegral $ natVal (Proxy :: Proxy fw) * natVal (Proxy :: Proxy fh)
+      fmd = fm `div` fromIntegral (dialateInX * dialateInY)
+      fin = fromIntegral (natVal (Proxy :: Proxy di)) * fm :: Int
+      fout = fromIntegral (natVal (Proxy :: Proxy fd)) * fmd :: Int
    in do
-        fmx <- mxFromList filt (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* fd))
-        pure $ (DeconvolveSt fmx Nothing, gen1)
+        (fmx, gen1) <- randomMx rf gen (Proxy :: Proxy fw) (Proxy :: Proxy fh) (Proxy :: Proxy (di GHC.TypeLits.* fd)) fin fout
+        ffmx <- Data.BlasM.flip fmx FlipBoth
+        pure $ (DeconvolveSt fmx ffmx Nothing, gen1)
 
 deconvolve ::
   forall m mx wi hi di wo ho g fw fh fd sx sy pxl pxr pyt pyb gconf gst gbst.
@@ -209,6 +256,7 @@ deconvolve ::
   -- | Padding size
   Proxy '(pxl, pxr, pyt, pyb) ->
   Layer m mx (DeconvolveSt mx fw fh fd di gst, LayerBiasSt mx fd gbst) (DeconvolveIn mx wi hi di, ()) (DeconvolveG mx fw fh fd di, Matrix mx 1 1 fd) wi hi di wo ho fd gconf (gst, gbst) g
-deconvolve pxf pxs pxp =
+deconvolve _ pxs pxp =
   let px = Proxy :: Proxy '(fw, fh, fd, di)
-   in (Layer (deconForward pxs pxp) (deconBackward pxs pxp) (deconAvg px) (deconUpd px) (deconInit px)) `connect` layerBias (Proxy :: Proxy '(wo, ho, fd))
+      pxi = Proxy :: Proxy '(fw, fh, fd, di, sx, sy)
+   in (Layer (deconForward pxs pxp) (deconBackward pxs pxp) (deconAvg px) (deconUpd px) (deconInit pxi) deconSerialize) `connect` layerBias (Proxy :: Proxy '(wo, ho, fd))

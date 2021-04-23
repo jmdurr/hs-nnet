@@ -2,17 +2,15 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE ScopedTypeVariables #-}
+{-# LANGUAGE DataKinds #-}
 
 module ML.NNet.GradientMod.RMSProp where
 
 import Data.BlasM
 import GHC.TypeLits
 import ML.NNet
-import ML.NNet.Convolve
-import ML.NNet.Deconvolve
-import ML.NNet.FullyConnectedSGD
-import ML.NNet.LeakyRelu
-import ML.NNet.Relu
+import Data.Proxy
+
 
 data RMSProp = RMSProp Double Double
 
@@ -33,3 +31,5 @@ instance (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => GradientDescentMeth
     dwt <- mult dwt1 grad
     wt <- add wgt dwt
     pure (wt, vt)
+
+  serializeMod _ = (maybeDeserializeMx (Proxy :: Proxy '(w,h,d)), maybeSerializeMx)

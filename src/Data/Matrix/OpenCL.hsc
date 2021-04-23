@@ -1,5 +1,7 @@
 {-# LANGUAGE ForeignFunctionInterface #-}
 {-# LANGUAGE GADTs #-}
+{-# LANGUAGE DeriveGeneric #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 module Data.Matrix.OpenCL where
 
 
@@ -9,20 +11,22 @@ import Data.Word
 import Foreign.Ptr
 import Foreign.C.String
 import Data.Bits
-import Foreign.ForeignPtr (ForeignPtr(..),withForeignPtr, touchForeignPtr)
+import Foreign.ForeignPtr (ForeignPtr,withForeignPtr, touchForeignPtr, mallocForeignPtrBytes, castForeignPtr)
 import Foreign.Concurrent (newForeignPtr)
-import Data.Either
 import Control.Monad.IO.Class
 import Foreign.Marshal.Alloc
 import Foreign.Marshal.Array
-import Data.List (foldl1', intercalate)
+import Data.List (intercalate)
 import Foreign.Storable
 import Data.Proxy
-import Control.Monad (void)
+import Control.Monad (void,when)
 import qualified Data.ByteString as BS
-import Debug.Trace
 import Data.Maybe (catMaybes)
-
+import GHC.Generics
+import Control.DeepSeq
+import qualified Data.Vector.Storable as V
+import System.IO (hPutStrLn,stderr)
+import Debug.Trace (traceStack)
 #include <openclhs.h>
 
 newtype CLDefine = CLDefine CInt deriving (Eq,Ord,Show)
@@ -256,7 +260,12 @@ type CLPlatformID = Ptr ()
 type CLDeviceID = Ptr ()
 type CLContextProperties = Ptr ()
 type CLMem_ = Ptr ()
-data CLMem a = CLMem #{type size_t} (ForeignPtr ()) (Proxy a)
+data CLMem a = CLMem #{type size_t} (ForeignPtr ()) (Proxy a) deriving (Generic, Generic1)
+instance (NFData (ForeignPtr a)) where
+  rnf = rwhnf
+instance (NFData1 ForeignPtr) where
+  liftRnf _ = rwhnf
+instance (NFData a) => NFData (CLMem a)
 type CLContext = Ptr ()
 type CLCommandQueue_ = Ptr ()
 -- things can reallocate the queue (poo)
@@ -284,6 +293,11 @@ clTry rio vio = do
   if r /= clSuccess 
     then pure $ Left (show r)
     else Right <$> vio
+
+clFail :: String -> IO CLDefine -> IO ()
+clFail s v = do
+  r <- v
+  if r /= clSuccess then fail (s <> " : " <> show r) else pure ()
 
 clNumPlatforms :: (MonadFail m, MonadIO m) => m CLUInt
 clNumPlatforms = failLeft $ 
@@ -336,13 +350,32 @@ clCreateCommandQueue ctx dev props =
           poke ptr' q
           newForeignPtr ptr' (freeCmdQueue ptr')
           
-clCreateBuffer :: (Storable a, Floating a, MonadFail m, MonadIO m) => CLContext -> CLMemFlag -> Word64 -> Proxy a -> m (CLMem a)  
+clCreateBuffer :: (Storable a, MonadFail m, MonadIO m) => CLContext -> CLMemFlag -> Word64 -> Proxy a -> m (CLMem a)  
 clCreateBuffer ctx flg len pxy = do
   --liftIO $ putStrLn $ "createBuf: " <> show len <> ":" <> show (sizeOf (asProxyTypeOf 0.0 pxy))
   failLeft $
     alloca $ \ptr -> do
-      mem <- clCreateBuffer_ ctx flg (len * fromIntegral (sizeOf (asProxyTypeOf 0.0 pxy))) nullPtr ptr
+      -- always add 16 so we can use vector functions
+      let needsz = (len + 16) * fromIntegral (sizeOf (asProxyTypeOf undefined pxy))
+      mem <- clCreateBuffer_ ctx flg needsz nullPtr ptr
       clTry (peek ptr) (newForeignPtr mem (clReleaseMemObject mem) >>= \v -> pure (CLMem len v pxy))
+
+clCreateFilledBuffer :: (Storable a, MonadFail m, MonadIO m) => CLContext -> CLCommandQueue -> CLMemFlag -> Word64 -> a -> m (CLMem a)
+clCreateFilledBuffer ctx queue flg len val = do
+  mem@(CLMem _ memptr _) <- clCreateBuffer ctx flg len (Proxy :: Proxy a)
+  
+  liftIO $ withForeignPtr queue $ \queue' -> alloca $ \ptr -> do
+       queuePtr <- peek queue'
+       poke ptr val
+       withForeignPtr memptr $ \mem' -> alloca $ \eptr -> do
+         r <- clEnqueueFillBuffer_ queuePtr mem' (castPtr ptr :: Ptr ()) (fromIntegral $ sizeOf val) 0 (len * fromIntegral (sizeOf val)) 0 nullPtr eptr
+         when (r /= clSuccess) (fail $ "Enqueue fill buffer failed with " <> show r)
+         er <- clWaitForEvents_ 1 eptr
+         when (er /= clSuccess) (fail "Failed waiting for create filled buffer event")
+         pure mem
+         
+
+
 
 
 withBs :: [BS.ByteString] -> [CString] -> ([CString] -> IO a) -> IO a
@@ -351,7 +384,7 @@ withBs [] cs iof = iof cs
 withBs (b:bs) cs iof = BS.useAsCString b (\cs' -> withBs bs (cs ++ [cs']) iof)
 
 clCreateProgramWithSource :: (MonadIO m, MonadFail m) => CLContext -> [BS.ByteString] -> m (CLProgram)
-clCreateProgramWithSource ctx [] = fail "Cannot create an empty program"
+clCreateProgramWithSource _ [] = fail "Cannot create an empty program"
 clCreateProgramWithSource ctx xs = do -- wrap all of this in a big try catch (eww)
   --liftIO $ putStrLn "prog src"
   ptr <- liftIO $ alloca $ \e -> 
@@ -437,8 +470,8 @@ clGetProgramBuildInfo prog dev = do
           infoErr $ clGetProgramBuildInfo_ pprog dev clProgramBuildOptions (fromIntegral pSize) ptr szPtr
           opts <- peekCString (castPtr ptr)
           infoErr $ clGetProgramBuildInfo_ pprog dev clProgramBuildLog (fromIntegral pSize) ptr szPtr
-          log <- peekCString (castPtr ptr)
-          pure $ CLProgramBuildInfo status opts log
+          lg <- peekCString (castPtr ptr)
+          pure $ CLProgramBuildInfo status opts lg
 
   where pSize = 64000
         infoErr fio = do
@@ -448,15 +481,15 @@ clGetProgramBuildInfo prog dev = do
             else pure ()
 
 
-clEnqueueWriteBuffer :: (Floating a, Storable a, MonadFail m, MonadIO m) => CLCommandQueue -> CLMem a -> [a] -> m ()
+clEnqueueWriteBuffer :: (Storable a, MonadFail m, MonadIO m) => CLCommandQueue -> CLMem a -> [a] -> m ()
 clEnqueueWriteBuffer queue (CLMem len mem pxy) xs = do
   --liftIO $ putStrLn "writebuf"
   failLeft $ 
     let xsLen = fromIntegral (length xs) in
-      if xsLen /= len
-        then pure (Left "trying to enqueuewritebuffer with list size that does not match memory size")
+      if xsLen > len
+        then pure (Left "trying to enqueuewritebuffer with list size that is larger than memory size")
         else do
-          let bsz = len * fromIntegral (sizeOf (asProxyTypeOf 0.0 pxy))
+          let bsz = len * fromIntegral (sizeOf (asProxyTypeOf undefined pxy))
           allocaBytes (fromIntegral bsz) $ \ptr -> do
             pokeArray ptr xs
             clTry (withForeignPtr queue (\queue' -> do
@@ -465,11 +498,33 @@ clEnqueueWriteBuffer queue (CLMem len mem pxy) xs = do
                       clEnqueueWriteBuffer_ queuePtr mem' clTrue 0 (fromIntegral bsz) (castPtr ptr) 0 nullPtr nullPtr)))
                   (pure ())
 
-clBufferFromList :: (Floating a, Storable a, MonadFail m, MonadIO m) => CLContext -> CLCommandQueue -> [a] -> m (CLMem a)
+clEnqueueWriteVec :: (Storable a, MonadFail m, MonadIO m) => CLCommandQueue -> CLMem a -> V.Vector a -> m ()
+clEnqueueWriteVec queue (CLMem len mem pxy) xs = do
+  failLeft $ 
+    let xsLen = fromIntegral (V.length xs) in
+      if xsLen > len
+        then pure (Left "trying to enqueuewritebuffer with list size that is larger than memory size")
+        else do
+          let bsz = xsLen * fromIntegral (sizeOf (asProxyTypeOf undefined pxy))
+          V.unsafeWith xs $ \ptr -> do
+            clTry (withForeignPtr queue (\queue' -> do
+                    queuePtr <- peek queue' 
+                    withForeignPtr mem (\mem' -> 
+                      clEnqueueWriteBuffer_ queuePtr mem' clTrue 0 (fromIntegral bsz) (castPtr ptr) 0 nullPtr nullPtr)))
+                  (pure ())
+
+
+clBufferFromList :: (Storable a, MonadFail m, MonadIO m) => CLContext -> CLCommandQueue -> [a] -> m (CLMem a)
 clBufferFromList ctx q ls = do
   --liftIO $ putStrLn $ "buf from l: " <> show (length ls + length ls) -- TODO clblast memorycheck is messed up?
-  b <- clCreateBuffer ctx clMemReadWrite (fromIntegral $ length ls) (undefined :: Proxy a) 
+  b <- clCreateBuffer ctx clMemReadWrite (fromIntegral $ length ls) (Proxy :: Proxy a) 
   clEnqueueWriteBuffer q b ls
+  pure b
+
+clBufferFromVec :: (Storable a, MonadFail m, MonadIO m) => CLContext -> CLCommandQueue -> V.Vector a -> m (CLMem a)
+clBufferFromVec ctx q ls = do
+  b <- clCreateBuffer ctx clMemReadWrite (fromIntegral $ V.length ls) (Proxy :: Proxy a)
+  clEnqueueWriteVec q b ls
   pure b
   
 clEnqueueReadBuffer :: (Floating a, Storable a, MonadFail m, MonadIO m) => CLCommandQueue -> CLMem a -> m [a]
@@ -486,9 +541,27 @@ clEnqueueReadBuffer queue (CLMem len mem pxy) = do
                       )
                       (peekArray (fromIntegral len) (castPtr buf))
               )
+
+clEnqueueReadVec :: forall a m. (Floating a, Storable a, MonadFail m, MonadIO m) => CLCommandQueue -> CLMem a -> m (V.Vector a)
+clEnqueueReadVec queue (CLMem len mem pxy) = do
+  --liftIO $ putStrLn "readbuf"
+  let bsz = fromIntegral len *  (sizeOf (asProxyTypeOf 0.0 pxy))
+  fpbuf <- liftIO $ mallocForeignPtrBytes bsz
+  failLeft $        
+            withForeignPtr fpbuf
+              (\buf ->
+                clTry (withForeignPtr queue (\queue' -> do
+                                                queuePtr <- peek queue'
+                                                withForeignPtr mem (\memPtr -> clEnqueueReadBuffer_ queuePtr memPtr clTrue 0 (fromIntegral bsz) buf 0 nullPtr nullPtr)
+                                            )
+                      )
+                      (pure ())
+              )
+  pure (V.unsafeFromForeignPtr0 (castForeignPtr fpbuf) (fromIntegral len))
+
           
 clDebugBuffer :: (Floating a, Storable a, MonadFail m, MonadIO m, Show a) => CLCommandQueue -> CLMem a -> String -> m ()
-clDebugBuffer q mem@(CLMem len mem' pxy) t = do
+clDebugBuffer q mem@(CLMem _ mem' _) t = do
   ls <- clEnqueueReadBuffer q mem
   liftIO $ putStrLn (t <> " - first entry of mem: " <> show mem' <> " is " <> show (head ls)) 
 
@@ -503,7 +576,8 @@ clWaitForEvent (ev,tch) = do
   liftIO $ withForeignPtr ev (\ev' ->
     alloca (\ptr -> do
       poke ptr ev'
-      void $ clWaitForEvents_ 1 ptr    
+      r <- clWaitForEvents_ 1 ptr
+      when (r /= clSuccess) (fail $ "failed waiting for event with " <> show r)
     )
     )
   liftIO $ mapM_ touchForeignPtr tch
@@ -591,11 +665,13 @@ data CLDeviceInfo = CLDeviceInfo {  clDeviceInfoAvailable :: Bool
                                   , clDeviceInfoMaxComputeUnits :: CLUInt
                                   , clDeviceInfoMaxClockFrequency :: CLUInt
                                   , clDeviceInfoMaxConstantBufferSize :: CLULong
+                                  , clDeviceInfoMaxLocalBufferSize :: CLULong
                                   , clDeviceInfoMaxMemAllocSize :: CLULong
                                   , clDeviceInfoMaxParameterSize :: CLUInt
                                   , clDeviceInfoMaxSamplers :: CLUInt
                                   , clDeviceInfoMaxWorkGroupSize :: #type size_t
                                   , clDeviceInfoMaxWorkItemDims :: CLUInt
+                                  , clDeviceInfoMaxWorkItems :: [#{type size_t}]
                                   , clDeviceInfoName :: String
                                   , clDeviceInfoType :: CLDeviceType
                                   , clDeviceInfoVendor :: String
@@ -617,11 +693,13 @@ clDeviceInfo dev =
                  <*> clNum clDeviceMaxComputeUnits #{size cl_uint}
                  <*> clNum clDeviceMaxClockFrequency #{size cl_uint}
                  <*> clNum clDeviceMaxConstantBufferSize #{size cl_ulong}
+                 <*> clNum clDeviceLocalMemSize #{size cl_ulong}
                  <*> clNum clDeviceMaxMemAllocSize #{size cl_ulong}
                  <*> clNum clDeviceMaxParameterSize #{size size_t}
                  <*> clNum clDeviceMaxSamplers #{size cl_uint}
                  <*> clNum clDeviceMaxWorkGroupSize #{size size_t}
                  <*> clNum clDeviceMaxWorkItemDimensions #{size cl_uint}
+                 <*> clNumList 3 clDeviceMaxWorkItemSizes #{size size_t}
                  <*> clString clDeviceName
                  <*> (CLDeviceType <$> clNum clDeviceType #{size cl_device_type})
                  <*> clString clDeviceVendor
@@ -641,6 +719,9 @@ clDeviceInfo dev =
                                        )
         clNum :: (MonadFail m, MonadIO m, Num a, Storable a) => CLDeviceInfoFlag -> Int -> m a
         clNum p sz = clGetParam p sz (\ptr _ -> peek (castPtr ptr))
+        clNumList :: (MonadFail m, MonadIO m, Num a, Storable a) => Int -> CLDeviceInfoFlag -> Int -> m [a]
+        clNumList eles p sz = clGetParam p (eles * sz) (\ptr _ -> peekArray eles (castPtr ptr)) 
+
 
         clGetParam :: (MonadFail m, MonadIO m) => CLDeviceInfoFlag -> Int -> (Ptr () -> Word64 -> IO b) -> m b
         clGetParam p sz pf = 
@@ -655,8 +736,10 @@ clDeviceInfo dev =
 data CLArgument where
   CLAPlain :: (Storable a) => a -> CLArgument
   CLAMem :: (Storable a) => CLMem a -> CLArgument
+  CLALocalMem :: (Storable a) => Proxy a -> #{type size_t} -> CLArgument
+  
 
-clRunKernel :: (MonadFail m, MonadIO m) => CLCommandQueue -> CLKernel -> [CLArgument] -> (Word64,Maybe Word64, Maybe Word64) -> m CLEvent 
+clRunKernel :: (MonadFail m, MonadIO m) => CLCommandQueue -> CLKernel -> [CLArgument] -> ((Word64,Word64),Maybe (Word64,Word64), Maybe (Word64,Word64)) -> m CLEvent 
 clRunKernel queue kern args dims = do
   --liftIO $ putStrLn "ka 1"
   mems <-  liftIO $ catMaybes <$> mapM setKernelArg (zip [0..] args)
@@ -664,13 +747,15 @@ clRunKernel queue kern args dims = do
   liftIO $ do
     --putStrLn ("nd1 " <> show dims)  
     ev <- withForeignPtr queue $ \queue' -> 
-      withForeignPtr kern $ \kern' -> 
+      withForeignPtr kern $ \kern' -> do
+        --liftIO $ print (dimArr dims)
         withArray (dimArr dims) $ \dimPtr -> 
           alloca $ \e -> do
             q <- peek queue'
-            r <- clEnqueueNDRangeKernel_ q kern' (numDims dims) nullPtr dimPtr nullPtr 0 nullPtr e
+            -- globalDims must be evenly divisible by localDims
+            r <- clEnqueueNDRangeKernel_ q kern' (numDims dims) nullPtr dimPtr (plusPtr dimPtr (numDims dims * sizeOf (undefined :: Word64)) :: Ptr Word64) 0 nullPtr e
             if r /= clSuccess
-              then fail ("clEnqueueNDRangeKernel failed with code: " <> show r)
+              then fail (traceStack "stack:" ("clEnqueueNDRangeKernel failed with code: " <> show r <> " dims " <> show (dimArr dims)))
               else (peek e >>= clEventPtrToForeignPtr (kern:mems))
     --putStrLn "nd2"
     pure ev
@@ -678,17 +763,22 @@ clRunKernel queue kern args dims = do
   where numDims (_,Just _, Just _) = 3
         numDims (_,Just _, Nothing) = 2
         numDims (_,Nothing,_) = 1
-        dimArr (x,Nothing,_) = [x]
-        dimArr (x,Just y, Nothing) = [x,y]
-        dimArr (x,Just y, Just z) = [x,y,z]
+        dimArr :: ((Word64,Word64),Maybe (Word64,Word64),Maybe (Word64,Word64)) -> [Word64]
+        dimArr ((x,lx),Nothing,_) = [x,lx]
+        dimArr ((x,lx),Just (y,ly), Nothing) = [x,y,lx,ly]
+        dimArr ((x,lx),Just (y,ly), Just (z,lz)) = [x,y,z,lx,ly,lz]
         setKernelArg (i,CLAPlain flt) = withForeignPtr kern (\kpt -> alloca (\p -> poke p flt >> clSetKernelArg kpt i (fromIntegral $ sizeOf flt) (castPtr p))) >> pure Nothing
-        setKernelArg (i,CLAMem (CLMem len mpt pxy)) = do
+        setKernelArg (i,CLAMem (CLMem _ mpt _)) = do
           withForeignPtr kern $ \kpt' ->
             withForeignPtr mpt $ \mpt' -> 
               alloca $ \mptf -> do
                 poke mptf mpt'
-                clSetKernelArg kpt' i #{size cl_mem} (castPtr mptf)
+                clFail ("failed setting kernel arg " <> show i) $ clSetKernelArg kpt' i #{size cl_mem} (castPtr mptf)
           pure (Just mpt)
+                
+        setKernelArg (i,CLALocalMem px n) = do
+          withForeignPtr kern $ \kpt' -> clFail ("failed setting clkernel arg local " <> show i) $ clSetKernelArg kpt' i (fromIntegral (sizeOf (asProxyTypeOf undefined px)) * n) nullPtr
+          pure Nothing
 
 foreign import ccall "clGetPlatformIDs" clGetPlatformIDs :: CLUInt -> Ptr CLPlatformID -> Ptr CLUInt -> IO CLDefine
 foreign import ccall "clGetDeviceIDs" clGetDeviceIDs :: CLPlatformID -> CLDeviceType -> CLUInt -> Ptr CLDeviceID -> Ptr CLUInt -> IO CLDefine
@@ -712,6 +802,7 @@ foreign import ccall "clCreateKernel" clCreateKernel_ :: CLProgram_ -> CString -
 foreign import ccall "clSetKernelArg" clSetKernelArg :: CLKernel_ -> CLUInt -> #{type size_t} -> Ptr () -> IO CLDefine
 foreign import ccall "clEnqueueNDRangeKernel" clEnqueueNDRangeKernel_ :: CLCommandQueue_ -> CLKernel_ -> CLUInt -> Ptr #{type size_t} -> Ptr #{type size_t} -> Ptr #{type size_t} -> CLUInt -> Ptr CLEvent_ -> Ptr CLEvent_ -> IO CLDefine
 foreign import ccall "clGetProgramBuildInfo" clGetProgramBuildInfo_ :: CLProgram_ -> CLDeviceID -> CLProgramBuildInfoFlag -> #{type size_t} -> Ptr () -> Ptr #{type size_t} -> IO CLDefine
+foreign import ccall "clEnqueueFillBuffer" clEnqueueFillBuffer_ :: CLCommandQueue_ -> CLMem_ -> Ptr () -> #{type size_t} -> #{type size_t} -> #{type size_t} -> CLUInt -> Ptr CLEvent_ -> Ptr CLEvent_ -> IO CLDefine
 -- setKernelArg
 -- EnqueueNDRangeKernel
 
