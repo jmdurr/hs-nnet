@@ -66,6 +66,7 @@ data CLBlasState a = CLBlasState
     clCompiledMultLayer :: Maybe (CLProgram, CLKernel),
     clCompiledSumFlatten :: Maybe (CLProgram, CLKernel),
     clCompiledAdd :: Maybe (CLProgram, CLKernel),
+    clCompiledOuter :: Maybe (CLProgram, CLKernel),
     clCompiledSub :: Maybe (CLProgram, CLKernel),
     clCompiledDense :: Map String (CLProgram, CLKernel),
     clCompiledDenseT1 :: Maybe (CLProgram, CLKernel),
@@ -95,7 +96,7 @@ withCLGpu pxy st = do
   ds <- clGetDevices (head ps)
   ctx <- clCreateContext ds
   q <- clCreateCommandQueue ctx (head ds) []
-  fst <$> runStateT st (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
+  fst <$> runStateT st (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
 
 prepCLGpu :: (MonadFail m, MonadIO m) => Proxy a -> m (CLBlasState a)
 prepCLGpu pxy = do
@@ -104,7 +105,7 @@ prepCLGpu pxy = do
   ctx <- clCreateContext ds
   q <- clCreateCommandQueue ctx (head ds) []
 
-  pure (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
+  pure (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
 
 execClGpu :: (MonadFail m, MonadIO m) => CLBlasState a -> StateT (CLBlasState a) m b -> m (b, CLBlasState a)
 execClGpu st fun = runStateT fun st
@@ -213,7 +214,27 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
     pure (Matrix (CLBlasMx memo h1 h2 d))
 
 
-  outer mx1@(Matrix (CLBlasMx mem1 _ l1 _)) mx2@(Matrix (CLBlasMx mem2 _ l2 _)) = denseT2 mx1 mx2
+  -- outer, multiply each element of mx1 with each element of mx2
+  outer mx1@(Matrix (CLBlasMx mem1 _ l1 _)) mx2@(Matrix (CLBlasMx mem2 _ l2 _)) = 
+    do
+      -- liftIO $ printf "add\n"
+      cls <- get
+      memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ l1 * l2) (clProxy cls)
+      kern <- case clCompiledOuter cls of
+        Just (_, k) -> pure k
+        Nothing -> do
+          let code = BC.pack $ pretty 120 (ppr $ outerC cls)
+          (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "outerC"
+          put cls {clCompiledOuter = Just (prog, k')}
+          pure k'
+
+      let tilesizeX = 8
+      let numtilesX = l1 `div` 8 + if l1 `mod` 8 > 0 then 1 else 0
+      let tilesizeY = 8
+      let numtilesY = l2 `div` 8 + if l2 `mod` 8 > 0 then 1 else 0
+      e <- clRunKernel (clCommandQueue cls) kern [CLAPlain (fromIntegral l1 :: CInt), CLAPlain (fromIntegral l2 :: CInt), CLAMem mem1, CLAMem mem2,  CLAMem memo] ((fromIntegral (numtilesX * tilesizeX), fromIntegral tilesizeX), Just (fromIntegral (numtilesY), fromIntegral 1), Nothing)
+      clWaitForEvent e
+      pure (Matrix (CLBlasMx memo l2 l1 1))
 
   scale mx amt = mx `applyFunction` Mul Value (Const amt)
 
@@ -1087,11 +1108,16 @@ denseC cls fname tilesize =
   */
 
                                 // to get to a row I have to skip all depths
-                                localARows[threadId * toRead + i] = 
-                                   mx1[(d*M*N + aRowOff + ((threadId * toRead + i) / $int:aColsPerTile)) + (((threadId * toRead + i) % $int:aColsPerTile) + acol)*M];
+                                  localARows[threadId * toRead + i] = 
+                                    (aRowOff + (threadId * toRead + i) / $int:aColsPerTile < M && ((threadId * toRead + i) % $int:aColsPerTile + acol < N)) ? 
+                                     mx1[(d*M*N + aRowOff + ((threadId * toRead + i) / $int:aColsPerTile)) + (((threadId * toRead + i) % $int:aColsPerTile) + acol)*M] : 
+                                     0;
+                                
                               } else{  
                                 localARows[threadId * toRead + i] = 
-                                  mx1[(aRowOff + d * M + ((threadId * toRead + i) / $int:aColsPerTile))*N + ((threadId * toRead + i) % $int:aColsPerTile) + acol];
+                                  (aRowOff + ((threadId * toRead + i) / $int:aColsPerTile) < M && (((threadId * toRead + i) % $int:aColsPerTile) + acol < N)) ? 
+                                  mx1[(aRowOff + d * M + ((threadId * toRead + i) / $int:aColsPerTile))*N + ((threadId * toRead + i) % $int:aColsPerTile) + acol] :
+                                  0;
                               }
                             }
 
@@ -1106,9 +1132,17 @@ denseC cls fname tilesize =
                                   ,mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)]
                                 );
   */
-                                localBCols[threadId * toRead + i] = mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)];
+                                localBCols[threadId * toRead + i] = 
+                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < M)) ?
+                                    mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)] : 
+                                    0;
                               } else {
-                                localBCols[threadId * toRead + i] = mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N)*K)+(bColOff + (threadId * toRead + i) / $int:aColsPerTile)];
+                                localBCols[threadId * toRead + i] = 
+                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < M)) ?
+
+                                    mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N)*K)+(bColOff + (threadId * toRead + i) / $int:aColsPerTile)] :
+                                    0;
+
                               }
                             }
 
@@ -1170,7 +1204,7 @@ denseC cls fname tilesize =
                                   
                                   );
   */
-                                  result[i] += aRow[c] * localBCols[((startCol+i) % $int:bColsPerTile)*$int:aColsPerTile + c];
+                                  result[i] += (aRow[c] * localBCols[((startCol+i) % $int:bColsPerTile)*$int:aColsPerTile + c]);
                                 }
                               }
                             }
@@ -1194,6 +1228,41 @@ denseC cls fname tilesize =
                                 output[(aRowOff+d*M+startRow+((startCol + i) / $int:bColsPerTile))*K+(bColOff + (startCol + i) % $int:bColsPerTile)] 
                                   = result[i];                            
                             }
+                          }
+                        }
+                      }
+      |]
+
+
+outerC :: CLBlasType a => CLBlasState a -> Language.C.Syntax.Func
+outerC cls =
+  let typ = ctypes cls
+     
+   in [cfun|kernel void outerC(int M, int N,
+                      const global $ty:typ * mx1,
+                      const global $ty:typ * mx2,
+                      global $ty:typ* output
+                      ){
+                        local $ty:typ localV[8];
+                        const int uoff = get_group_id(0)*8;
+                        const int voff = get_group_id(1)*8;
+
+                        const int threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
+                        
+                        // read 2 per thread
+                        $ty:typ uVal = 0;
+                        if (threadId + uoff < M){
+                          uVal = mx1[threadId+uoff];
+                        }
+                        if (threadId + voff < N){
+                          localV[threadId] = mx2[threadId+voff];
+                        }
+                        barrier(CLK_LOCAL_MEM_FENCE);
+                        if (threadId + uoff < M && voff < N){
+                          // multiply 8 per thread
+                          for (int i = 0; i < 8; i++){
+                            if (voff+i < N)
+                              output[(uoff+threadId)*N+voff+i] = uVal * localV[i];
                           }
                         }
                       }
