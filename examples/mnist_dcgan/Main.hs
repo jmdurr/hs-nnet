@@ -19,6 +19,7 @@ import Data.Proxy
 import Data.Serialize
 import Data.Text (unpack)
 import qualified Data.Vector.Storable as V
+import Debug.Trace
 import Foreign.C.Types
 import ML.NNet
 import ML.NNet.Convolve
@@ -27,6 +28,8 @@ import ML.NNet.Deconvolve
 import ML.NNet.Dropout
 import ML.NNet.FullyConnectedSGD
 import ML.NNet.GradientMod.Adam
+import ML.NNet.GradientMod.Momentum
+import ML.NNet.GradientMod.Rate
 import ML.NNet.Init.RandomFun
 import ML.NNet.LeakyRelu
 import ML.NNet.Reshape
@@ -67,6 +70,7 @@ discriminator =
     `connect` leakyRelu 0.2 (Proxy :: Proxy 1) (Proxy :: Proxy 256) (Proxy :: Proxy 1)
     `connect` dropout (mkStdGen 397212372) 0.3
     `connect` fullyConnectedSGD (Proxy :: Proxy 256) (Proxy :: Proxy 1)
+    --`connect` debugLayer "presigmoid" True True (liftIO . putStrLn . unpack)
     `connect` sigmoid (Proxy :: Proxy '(1, 1, 1))
 
 {-
@@ -189,17 +193,16 @@ crossEntropyError output desired = do
   -- if desired is 1 then 1 - desired else desired
   -- sum (negative (a*log(p) + (1-a)*log(1-p))) / n
   vals <- mapM (\o -> V.head <$> mxToVec o) output
-  let es = zipWith (\targ out -> targ * (log out) + (1 - targ) * log (1 - out)) (map (\d -> if d then (1.0 - 1e-6) else 1e-6) desired) vals
-  let sm = sum es
-  let avg = negate (sm / (fromIntegral (length es)))
-  pure avg
+  liftIO $ print vals
+  let es = zipWith (\targ out -> (targ * (negate (log out)) + (1 - targ) * negate (log (1 - out)))) (map (\d -> if d then (1.0 - 1e-6) else 1e-6) desired) vals
+  pure (sum es)
 
 -- (-d/out + (1-d) / (1-o))
 crossEntropyErrorDO :: (BlasM m mx) => Matrix mx 1 1 1 -> Matrix mx 1 1 1 -> m (Matrix mx 1 1 1)
 crossEntropyErrorDO output desired = do
   target <- V.head <$> mxToVec desired
   out <- V.head <$> mxToVec output
-  let out' = if out <= 0 then 1e-6 else if out >= 1 then (1.0 - 1e-6) else out
+  let out' = out
   let res = (out' - target) / (out' * (1 - out'))
   --if (out - target <= 0 then 0 else (1-1) / (1*(1-1)) -- infinite)
   -- (0-0) / (0*(1-0)) -- infinite
@@ -230,7 +233,7 @@ processEpoch batchSize (disc, dst) (gen, gst) g allrs rands = do
   case gr of
     Nothing -> fail "no gradients from epoch"
     Just (dg, gg) -> do
-      dg' <- divideGradients disc dg (length allrs)
+      dg' <- divideGradients disc dg (length allrs * 2)
       gg' <- divideGradients gen gg (length allrs)
       gst' <- runUpdate gen gst gg'
       dst' <- runUpdate disc dst dg'
@@ -253,8 +256,8 @@ processEpoch batchSize (disc, dst) (gen, gst) g allrs rands = do
       derr <- crossEntropyError (map fst discFakes ++ map fst discReals) (fakeTarget ++ realTarget)
       gerr <- crossEntropyError (map fst discFakes) ganTarget
 
-      zeros <- replicateM (length discFakes) (konst 1e-7)
-      ones <- replicateM (length discReals) (konst (1.0 - 1e-7))
+      zeros <- replicateM (length discFakes) (konst 1e-6)
+      ones <- replicateM (length discReals) (konst (1.0 - 1e-6))
 
       deriv <- zipWithM crossEntropyErrorDO (map fst discFakes ++ map fst discReals) (zeros ++ ones)
       genDeriv <- zipWithM crossEntropyErrorDO (map fst discFakes) ones
@@ -292,14 +295,14 @@ main = do
     mnist <- loadMNist
     -- make same random numbers to sample
     liftIO $ putStrLn "make some rands"
-    let v = V.fromList (take 200000 (randomRs (-2.0 :: Double, 2.0) g1))
+    let v = V.fromList (take 200000 (randomRs (0 :: Double, 1) g1))
     liftIO $ putStrLn "save real images"
     saveExImages mnist
     liftIO $ printf "loaded %d images\n" (length mnist)
     liftIO $ putStrLn "init discriminator"
-    (disc, dst, g) <- initNetwork g1 glorotUniformWeights discriminator (Adam 0.0002 0.5 0.999)
+    (disc, dst, g) <- initNetwork g1 glorotUniformWeights discriminator (Rate 0.0002)
     liftIO $ putStrLn "init generator"
-    (gen, gst, g') <- initNetwork g glorotUniformWeights generator (Adam 0.0002 0.5 0.999)
+    (gen, gst, g') <- initNetwork g glorotUniformWeights generator (Rate 0.0002)
     liftIO $ putStrLn "save initial generations"
     saveImages (0 :: Int) gen gst g' v
     liftIO $ putStrLn "start training"

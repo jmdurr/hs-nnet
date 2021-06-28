@@ -33,6 +33,8 @@ import qualified Language.C.Syntax
 import Text.PrettyPrint.Mainland (pretty)
 import Text.PrettyPrint.Mainland.Class (ppr)
 import Text.Printf
+import Data.Time.Clock
+import Data.Time.Format
 
 data CLBlasMx a = CLBlasMx
   { clMem :: CLMem a,
@@ -65,8 +67,8 @@ data CLBlasState a = CLBlasState
     clCompiledSumFlatten :: Maybe (CLProgram, CLKernel),
     clCompiledAdd :: Maybe (CLProgram, CLKernel),
     clCompiledSub :: Maybe (CLProgram, CLKernel),
-    clCompiledDense :: Maybe (CLProgram, CLKernel),
-    clCompiledDenseT1 :: Maybe (CLProgram,CLKernel),
+    clCompiledDense :: Map String (CLProgram, CLKernel),
+    clCompiledDenseT1 :: Maybe (CLProgram, CLKernel),
     clCompiledDenseT2 :: Maybe (CLProgram, CLKernel),
     clProxy :: Proxy a,
     clMatMult :: Maybe (CLProgram, CLKernel)
@@ -85,9 +87,7 @@ instance CLBlasType CDouble where
 
 instance CLBlasType CFloat where
   clblasTypeNearZero _ = 1e-6
-  clblasTypeCStringRep _ = "double"
-
-deb [arch=amd64] url stable main
+  clblasTypeCStringRep _ = "float"
 
 withCLGpu :: (MonadFail m, MonadIO m) => Proxy a -> StateT (CLBlasState a) m b -> m b
 withCLGpu pxy st = do
@@ -95,7 +95,7 @@ withCLGpu pxy st = do
   ds <- clGetDevices (head ps)
   ctx <- clCreateContext ds
   q <- clCreateCommandQueue ctx (head ds) []
-  fst <$> runStateT st (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing pxy Nothing)
+  fst <$> runStateT st (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
 
 prepCLGpu :: (MonadFail m, MonadIO m) => Proxy a -> m (CLBlasState a)
 prepCLGpu pxy = do
@@ -104,7 +104,7 @@ prepCLGpu pxy = do
   ctx <- clCreateContext ds
   q <- clCreateCommandQueue ctx (head ds) []
 
-  pure (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing pxy Nothing)
+  pure (CLBlasState ctx q ds M.empty M.empty M.empty M.empty Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing Nothing M.empty Nothing Nothing pxy Nothing)
 
 execClGpu :: (MonadFail m, MonadIO m) => CLBlasState a -> StateT (CLBlasState a) m b -> m (b, CLBlasState a)
 execClGpu st fun = runStateT fun st
@@ -117,91 +117,104 @@ numWorkChunks chunkSize workSize =
   workSize `div` chunkSize + (if workSize `mod` chunkSize > 0 then 1 else 0)
 
 type CLBlasM m a = StateT (CLBlasState a) m
-
 instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) => BlasM (StateT (CLBlasState a) m) (CLBlasMx a) where
   nearZero = pure $ clblasTypeNearZero (Proxy :: Proxy a)
 
+
+  -- TODO dry this up with transposed versions
   dense (Matrix (CLBlasMx mem1 w h d)) (Matrix (CLBlasMx mem2 w1 _ _)) = do
     -- liftIO $ printf "dense\n"
     cls <- get
+    let ts = denseTileSize (fromIntegral h) (fromIntegral w) (fromIntegral w1)
+    let fn = denseCFunctionName ts
     -- liftIO $ printf "add\n"
-    kern <- case clCompiledDense cls of
+    kern <- case M.lookup fn (clCompiledDense cls) of
       Just (_, k) -> pure k
       Nothing -> do
-        let code = BC.pack $ pretty 120 (ppr $ fst (denseC cls (fromIntegral h) (fromIntegral w) (fromIntegral w1)))
-        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "denseC"
-        put cls {clCompiledDense = Just (prog, k')}
+        let code = BC.pack $ pretty 120 (ppr $ denseC cls fn ts)
+        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code fn
+        put cls {clCompiledDense = M.insert fn (prog, k') (clCompiledDense cls)}
         pure k'
-
-    let (_, items) = denseC cls (fromIntegral h) (fromIntegral w) (fromIntegral w1)
+    let items = denseCWorkgroups ts (fromIntegral h) (fromIntegral w1)
     -- tilesize is 16, 8 rows * 16 columns
     memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ h * w1 * d) (clProxy cls)
     -- mxo@(Matrix (CLBlasMx memo _ _ _)) <- konst 0.0
+    -- liftIO $ putStrLn "run dense kern"
     e <-
       clRunKernel
         (clCommandQueue cls)
         kern
-        [CLAPlain (fromIntegral h :: CInt), CLAPlain (fromIntegral w :: CInt), CLAPlain (fromIntegral w1 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
+        [CLAPlain (fromIntegral h :: CInt), CLAPlain (fromIntegral w :: CInt), CLAPlain (fromIntegral w1 :: CInt), CLAPlain (fromIntegral d :: CInt), CLAPlain (0 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
         items
-
+    -- liftIO $ putStrLn "collect dense kern"
     clWaitForEvent e
+    -- liftIO $ putStrLn "end dense kern"
+
     pure (Matrix (CLBlasMx memo w1 h d))
 
-  denseT1 (Matrix (CLBlasMx mem1 w1 h2 d1)) (Matrix (CLBlasMx mem2 w2 _ _)) = do
-    -- liftIO $ printf "denset1\n"
-    -- liftIO $ printf "dense\n"
+  denseT1 (Matrix (CLBlasMx mem1 w1 h2 d)) (Matrix (CLBlasMx mem2 w2 _ _)) = do
+        -- liftIO $ printf "dense\n"
     cls <- get
+    let ts = denseTileSize (fromIntegral w1) (fromIntegral h2) (fromIntegral w2)
+    let fn = denseCFunctionName ts
     -- liftIO $ printf "add\n"
-    kern <- case clCompiledDenseT1 cls of
+    kern <- case M.lookup fn (clCompiledDense cls) of
       Just (_, k) -> pure k
       Nothing -> do
-        let code = BC.pack $ pretty 120 (ppr $ fst (denseT1C cls (fromIntegral h2) (fromIntegral w1) (fromIntegral w2)))
-        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "denseT1C"
-        put cls {clCompiledDenseT1 = Just (prog, k')}
+        let code = BC.pack $ pretty 120 (ppr $ denseC cls fn ts)
+        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code fn
+        put cls {clCompiledDense = M.insert fn (prog, k') (clCompiledDense cls)}
         pure k'
-
-    let (_, items) = denseT1C cls (fromIntegral h2) (fromIntegral w1) (fromIntegral w2)
+    let items = denseCWorkgroups ts (fromIntegral w1) (fromIntegral w2)
     -- tilesize is 16, 8 rows * 16 columns
-    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ h2 * w2 * d1) (clProxy cls)
+    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ w1 * w2 * d) (clProxy cls)
     -- mxo@(Matrix (CLBlasMx memo _ _ _)) <- konst 0.0
+    -- liftIO $ putStrLn ("run denset1 kern" <> show (w1,h2,w2,d))
+    -- t <- liftIO $ getCurrentTime
     e <-
       clRunKernel
         (clCommandQueue cls)
         kern
-        [CLAPlain (fromIntegral h2 :: CInt), CLAPlain (fromIntegral w1 :: CInt), CLAPlain (fromIntegral w2 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
+        [CLAPlain (fromIntegral w1 :: CInt), CLAPlain (fromIntegral h2 :: CInt), CLAPlain (fromIntegral w2 :: CInt), CLAPlain (fromIntegral d :: CInt), CLAPlain (1 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
         items
-
+    -- liftIO $ putStrLn "wait denset1 kern"
     clWaitForEvent e
-    pure (Matrix (CLBlasMx memo w1 h2 d1))
+    -- t' <- liftIO $ getCurrentTime
+    -- liftIO $ putStrLn (formatTime defaultTimeLocale "end denset1 kern - %0Es"  (diffUTCTime t' t))
+    pure (Matrix (CLBlasMx memo w1 w2 d))
 
-  denseT2 (Matrix (CLBlasMx mem1 w1 h1 d1)) (Matrix (CLBlasMx mem2 w2 h2 _)) = do
-    -- liftIO $ printf "dense\n"
+  denseT2 (Matrix (CLBlasMx mem1 w1 h1 d)) (Matrix (CLBlasMx mem2 _ h2 _)) = do
+        -- liftIO $ printf "dense\n"
     cls <- get
+    let ts = denseTileSize (fromIntegral h1) (fromIntegral w1) (fromIntegral h2)
+    let fn = denseCFunctionName ts
     -- liftIO $ printf "add\n"
-    kern <- case clCompiledDenseT2 cls of
+    kern <- case M.lookup fn (clCompiledDense cls) of
       Just (_, k) -> pure k
       Nothing -> do
-        let code = BC.pack $ pretty 120 (ppr $ fst (denseT2C cls (fromIntegral h1) (fromIntegral w1) (fromIntegral w2)))
-        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "denseT2C"
-        put cls {clCompiledDenseT2 = Just (prog, k')}
+        let code = BC.pack $ pretty 120 (ppr $ denseC cls fn ts)
+        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code fn
+        put cls {clCompiledDense = M.insert fn (prog, k') (clCompiledDense cls)}
         pure k'
-
-    let (_, items) = denseT2C cls (fromIntegral h1) (fromIntegral w1) (fromIntegral w2)
+    let items = denseCWorkgroups ts (fromIntegral h1) (fromIntegral h2)
     -- tilesize is 16, 8 rows * 16 columns
-    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ h1 * w2 * d1) (clProxy cls)
+    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ h1 * h2 * d) (clProxy cls)
     -- mxo@(Matrix (CLBlasMx memo _ _ _)) <- konst 0.0
+    -- liftIO $ putStrLn "run denset2 kern"
     e <-
       clRunKernel
         (clCommandQueue cls)
         kern
-        [CLAPlain (fromIntegral h1 :: CInt), CLAPlain (fromIntegral w1 :: CInt), CLAPlain (fromIntegral w2 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
+        [CLAPlain (fromIntegral h1 :: CInt), CLAPlain (fromIntegral w1 :: CInt), CLAPlain (fromIntegral h2 :: CInt), CLAPlain (fromIntegral d :: CInt), CLAPlain (2 :: CInt), CLAMem mem1, CLAMem mem2, CLAMem memo]
         items
-
+    -- liftIO $ putStrLn "wait denset2 kern"
     clWaitForEvent e
-    pure (Matrix (CLBlasMx memo w1 h1 d1))
+    -- liftIO $ putStrLn "end denset2 kern"
+    pure (Matrix (CLBlasMx memo h1 h2 d))
+
 
   outer mx1@(Matrix (CLBlasMx mem1 _ l1 _)) mx2@(Matrix (CLBlasMx mem2 _ l2 _)) = denseT2 mx1 mx2
-    
+
   scale mx amt = mx `applyFunction` Mul Value (Const amt)
 
   -- TODO make a generic optC builder, perhaps move all compiled kernels to a map
@@ -271,24 +284,24 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
 
   subtractM (Matrix (CLBlasMx mem1 w h d)) (Matrix (CLBlasMx mem2 _ _ _)) =
     do
-    -- liftIO $ printf "add\n"
-    cls <- get
-    memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ w * h * d) (clProxy cls)
-    kern <- case clCompiledSub cls of
-      Just (_, k) -> pure k
-      Nothing -> do
-        let code = BC.pack $ pretty 120 (ppr $ opC cls "subC" (\l r -> [cexp|$exp:l - $exp:r|]))
-        (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "subC"
-        put cls {clCompiledSub = Just (prog, k')}
-        pure k'
+      -- liftIO $ printf "add\n"
+      cls <- get
+      memo <- clCreateBuffer (clContext cls) clMemReadWrite (fromIntegral $ w * h * d) (clProxy cls)
+      kern <- case clCompiledSub cls of
+        Just (_, k) -> pure k
+        Nothing -> do
+          let code = BC.pack $ pretty 120 (ppr $ opC cls "subC" (\l r -> [cexp|$exp:l - $exp:r|]))
+          (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "subC"
+          put cls {clCompiledSub = Just (prog, k')}
+          pure k'
 
-    let tilesizeX = min 16 w
-    let numtilesX = w `div` 16 + if w `mod` 16 > 0 then 1 else 0
-    let tilesizeY = min 16 h
-    let numtilesY = h `div` 16 + if h `mod` 16 > 0 then 1 else 0
-    e <- clRunKernel (clCommandQueue cls) kern [CLAMem mem1, CLAMem mem2, CLAPlain (fromIntegral w :: CInt), CLAPlain (fromIntegral h :: CInt), CLAMem memo] ((fromIntegral (numtilesX * tilesizeX), fromIntegral tilesizeX), Just (fromIntegral (numtilesY * tilesizeY), fromIntegral tilesizeY), Just (fromIntegral d, 1))
-    clWaitForEvent e
-    pure (Matrix (CLBlasMx memo w h d))
+      let tilesizeX = min 16 w
+      let numtilesX = w `div` 16 + if w `mod` 16 > 0 then 1 else 0
+      let tilesizeY = min 16 h
+      let numtilesY = h `div` 16 + if h `mod` 16 > 0 then 1 else 0
+      e <- clRunKernel (clCommandQueue cls) kern [CLAMem mem1, CLAMem mem2, CLAPlain (fromIntegral w :: CInt), CLAPlain (fromIntegral h :: CInt), CLAMem memo] ((fromIntegral (numtilesX * tilesizeX), fromIntegral tilesizeX), Just (fromIntegral (numtilesY * tilesizeY), fromIntegral tilesizeY), Just (fromIntegral d, 1))
+      clWaitForEvent e
+      pure (Matrix (CLBlasMx memo w h d))
 
   applyFunction (Matrix (CLBlasMx mem1 w1 h1 d1)) func =
     let hsh = hashFuncToStr func
@@ -470,25 +483,23 @@ mxFromVecH ds pw ph pd =
         pure (Matrix (CLBlasMx mem w' h' d'))
 
 -- switch these to pattern match on proxy instead
+ctypes :: CLBlasType a => CLBlasState a -> Language.C.Syntax.Type
 ctypes cls =
   if clblasTypeCStringRep (clProxy cls) == "double"
     then [cty|double|]
     else [cty|float|]
 
+ctypes4 :: CLBlasType a => CLBlasState a -> Language.C.Syntax.Type
 ctypes4 cls =
   if clblasTypeCStringRep (clProxy cls) == "double"
     then [cty|double4|]
     else [cty|float4|]
 
+ctypes8 :: CLBlasType a => CLBlasState a -> Language.C.Syntax.Type
 ctypes8 cls =
   if clblasTypeCStringRep (clProxy cls) == "double"
     then [cty|double8|]
     else [cty|float8|]
-
-ctypes16 cls =
-  if clblasTypeCStringRep (clProxy cls) == "double"
-    then [cty|double16|]
-    else [cty|float16|]
 
 reshapeMh ::
   forall w h d w2 h2 d2 a.
@@ -932,35 +943,6 @@ convolveC cls =
           }
       |]
 
--- mx is in row layout
--- clblas - 0.42s
--- naive implementation of dense multiplication (no local, process 1 row and 1 col - 10000x10000) - 10.33s
--- with 16x16 tile of b with 16 wide of row of a local memory tiled without vload/store or local memory - 16 - 334us, 14s   256 - 322us,7.4s
--- with 16x16 local memory tiled - 292us, 8.7s
--- with 16x16 local memory tiled with cast to 16 - 273us, 9.27s
--- with 16x16 local memory
--- with 16 rows and 64 columns - not skipping (small 1.3ms, large 2.2s)
--- with reqd workgroups (16,1,1) - not skipping (small 1.3ms, large 2.8)
--- for small matrices the whole thing fits in memory...
--- with 16 rows and 16 columns - s 304us l 4.7s r 8.4ms ffn
--- with 16 rows and 16 cols ty1 - s 476us l 8s r 15ms ffn
--- with 16 rows and 32 columns - s 564us l 18s r 22ms ffn
--- with 16 rows and 64 columns - s 1.3ms l 2.2s r 5.3ms ffn 1.3ms
--- with 16 rows and 64 columns -- is good for a long matrix, but not so good for a tall matrix...
--- with 1 rows and 4 cols -- dense 445us   ffn 442us   realistic 221ms
--- with 2 rows and 8 cols --       391us   ffn 388us   realistic 53ms
--- with 3 rows and 12 cols --      379us       375us             29ms
--- with 4 rows and 16 cols --      370         374               14
--- adjusted to 1 byte per type
--- with 4 rows and 4 cols --       394         392               103ms
--- with 8 rows and 8 cols --       425         421               42
--- optimized for AI:::
---    fully connected -> 1024x1 -> 1024x1024
---    32 threads
--- 3 rows with 12 columns -> optimized for 1x1024 * 1024x1024
--- 16 rows with 64 cols -> realistic
--- 16 rpws with 16 cols -> small
-
 -- 32 threads
 -- 64k local memory
 -- 128 total registers (use 96 for rows)
@@ -969,230 +951,250 @@ convolveC cls =
 -- pref workgroup size 32
 -- wavefront width 32
 
-denseC :: CLBlasType a => CLBlasState a -> Int -> Int -> Int ->  (Language.C.Syntax.Func, ((Word64, Word64), Maybe (Word64, Word64), Maybe (Word64, Word64)))
-denseC cls arows acols bcols =
-  
+-- 16,1,16
+-- 1024x1024 -> 240ms
+-- 1024x1 * 1x1024 -> 1.2
+-- 1x1024 * 1024x1024 -> 823us
+
+-- numthreads = arows * bColTileSize / colsPerThread
+--     arows,bcols,acoltilesize,colsPerThread
+-- t64   8,8,4     - 9.3ms  700us  240us
+-- t256 16,16,1    - 250ms  2.5ms  3.1ms
+-- t64   8,8,1     - 135ms  710us  1.25ms
+-- t64   8,16,1,2  - 113ms  656us  1.28ms
+-- t16   4,16,1,4  - 50.6ms 179us  977us
+
+
+-- t32  
+{-
+    wavefront is 32
+    workgroup size 32
+    64k local mem
+    128 registers per
+
+    32 * 4 numbers = 256 computations
+
+    32 threads per workgroup
+     at least 8 computations per thread + * 4 numbers
+    16x16 tile of B = 256 numbers
+
+
+   1024x1024 * 1024x1024
+   TS 8x8x4  11.65ms
+   TS 16x16x4 5.53ms
+
+   1x1024 * 1024x1024
+   TS 1x64x2  353ms
+   TS 8x8x2   335ms
+   TS 8x8x4   356ms
+   TS 1x64x2  355ms
+   TS 1x64x1x16 362ms
+
+   1024x1 * 1x1024
+   TS 32x32x1 3.51s
+   TS 32x32x4 3.67s
+   TS 16x16x1 384ms
+   TS 8x16x1  346ms
+   TS 8x8x1   339ms
+   TS 8x8x1x16 342ms
+   TS 32x8x1x32 354ms
+   TS 8x8x4x32  167us
+
+
+-}
+ 
+data TileSize = TileSize {rowsLeft :: Int, colsRight :: Int, colsLeft :: Int, tileThreads :: Int}
+
+-- tilethreads must be divisible by rowsLeft
+-- colsLeft * rowsLeft must be divisible by tileThreads
+-- rowsLeft * colsRight must be divisible by tileThreads
+denseTileSize :: Int -> Int -> Int -> TileSize
+denseTileSize _ _ _ = TileSize 8 8 4 32
+  -- | m == 1 && k == 1 = TileSize 16 16 1 32
+  -- | m == 1 = trace (printf "m %d n %d k %d" m n k) (TileSize 8 8 4 32)
+  -- | n > 3 = TileSize 8 8 4 32
+  -- | n > 1 = TileSize 16 16 2 32
+  -- | otherwise 
+  -- | m < 32 && n < 32 && k < 32 = TileSize 8 8 4
+  -- | m == 1 = TileSize 1 32 4
+
+
+denseCWorkgroups :: TileSize -> Int -> Int -> ((Word64, Word64), Maybe (Word64, Word64), Maybe (Word64, Word64))
+denseCWorkgroups tilesize m k =
+  let roughATiles = m `div` rowsLeft tilesize
+      roughBTiles = k `div` colsRight tilesize
+      numATiles = if roughATiles * rowsLeft tilesize < m then roughATiles + 1 else roughATiles
+      numBTiles = if roughBTiles * colsRight tilesize < k then roughBTiles + 1 else roughBTiles
+   in -- total work items = m * k
+     -- traceShowId
+        ( (fromIntegral (numATiles * rowsLeft tilesize), fromIntegral (rowsLeft tilesize)),
+          Just (fromIntegral (numBTiles * (tileThreads tilesize `div` rowsLeft tilesize)), fromIntegral (tileThreads tilesize `div` rowsLeft tilesize)),
+          Nothing
+        )
+denseCFunctionName :: TileSize -> String
+denseCFunctionName tilesize =
+  printf "dense_%d_%d_%d_%d" (rowsLeft tilesize) (colsRight tilesize) (colsLeft tilesize) (tileThreads tilesize)
+
+denseC :: CLBlasType a => CLBlasState a -> String -> TileSize -> Language.C.Syntax.Func
+denseC cls fname tilesize =
   let typ = ctypes cls
-      bColTileSize = 32
-      aRowTileSize = 32
-      aColTileSize = 1
-      colsPerThread = bColTileSize `div` aRowTileSize
-      numATiles = arows `div` aRowTileSize + if arows `mod` aRowTileSize == 0 then 0 else 1
-      numBTiles = bcols `div` bColTileSize + if bcols `mod` bColTileSize == 0 then 0 else 1
-   in ( [cfun|kernel void denseC(int M, int N, int K,
+      numThreads = tileThreads tilesize
+      bColsPerTile = colsRight tilesize
+      aColsPerTile = colsLeft tilesize
+      aRowsPerTile = rowsLeft tilesize
+      outputsPerThread = (aRowsPerTile * bColsPerTile) `div` numThreads
+      sharedRows = aRowsPerTile < numThreads
+      localSize
+        | sharedRows = aRowsPerTile * aColsPerTile
+        | otherwise = aRowsPerTile * aColsPerTile
+      -- with transpose, 1 = transpose left matrix
+      --                 2 = transpose right matrix
+      -- M,N,K should represent the sizes after any transpose
+   in [cfun|kernel void $id:fname(int M, int N, int K, int D, int T,
                       const global $ty:typ * mx1,
                       const global $ty:typ * mx2,
                       global $ty:typ* output
                       ){
-                        const int threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
-                        local $ty:typ localBCols[$int:bColTileSize*$int:aColTileSize];
-                        local $ty:typ localARows[$int:aRowTileSize*$int:aColTileSize];
-                        $ty:typ results[$int:colsPerThread];
-                        for (int i = 0; i < $int:colsPerThread; i++){
-                          results[i] = 0;
-                        }
+                        const size_t threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
+//                        printf("tid: %d\n",threadId);
+                        local $ty:typ localBCols[$int:bColsPerTile*$int:aColsPerTile];
+                        local $ty:typ localARows[$int:localSize];
+                        for (int d = 0; d < D; d++){
+                          const int startRow = (threadId * $int:outputsPerThread) / $int:bColsPerTile;
+                          const int startCol = (threadId * $int:outputsPerThread) % $int:bColsPerTile;
+
+                          $ty:typ result[$int:outputsPerThread];
+                          for (int o = 0; o < $int:outputsPerThread; o++){
+                            result[o] = 0.0;
+                          }
+                          const int aRowOff = get_group_id(0) * $int:aRowsPerTile;
+                          const int bColOff = get_group_id(1) * $int:bColsPerTile;
+
+                          for (int acol = 0; acol < N; acol += $int:aColsPerTile){
+                            // read A Rows
+                            int toRead = max($int:localSize / $int:numThreads,1); //8
+                            for (int i = 0; i < toRead && (threadId * toRead + i) < $int:localSize; i++){
+                              // a row = aRowOff + ((threadId * toRead + i)/aColsPerTile) 
+                              // a col = acol + ((threadId * toRead + i) % aColsPerTile)
+                         
+                              if (T == 1){
+  /*
+                              printf("assign d %d A[%d]=%f\n"
+                                ,d
+                                ,threadId * toRead + i
+                                ,mx1[(d*M*N + aRowOff + ((threadId * toRead + i) / $int:aColsPerTile)) + (((threadId * toRead + i) % $int:aColsPerTile) + acol)*M]
+                              );
+  */
+
+                                // to get to a row I have to skip all depths
+                                localARows[threadId * toRead + i] = 
+                                   mx1[(d*M*N + aRowOff + ((threadId * toRead + i) / $int:aColsPerTile)) + (((threadId * toRead + i) % $int:aColsPerTile) + acol)*M];
+                              } else{  
+                                localARows[threadId * toRead + i] = 
+                                  mx1[(aRowOff + d * M + ((threadId * toRead + i) / $int:aColsPerTile))*N + ((threadId * toRead + i) % $int:aColsPerTile) + acol];
+                              }
+                            }
+
+                            // read B Cols
+                            toRead = max(($int:bColsPerTile * $int:aColsPerTile) / $int:numThreads,1);
+                            for (int i = 0; i < toRead && (threadId * toRead + i) < ($int:bColsPerTile*$int:aColsPerTile); i++){
+                              if (T == 2){
+  /*
+                                 printf("assign d %d B[%d]=%f\n"
+                                  ,d
+                                  ,threadId * toRead + i
+                                  ,mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)]
+                                );
+  */
+                                localBCols[threadId * toRead + i] = mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)];
+                              } else {
+                                localBCols[threadId * toRead + i] = mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N)*K)+(bColOff + (threadId * toRead + i) / $int:aColsPerTile)];
+                              }
+                            }
+
+                            barrier(CLK_LOCAL_MEM_FENCE);
+  /*
+                            // print out localARow
+                              printf("A[%d] = %f\n"
+                                , threadId
+                                , localARows[threadId]
+                              );
+  */                        
+
+                            // multiply tiles
+                            // total multiplications
+                            // printf("outputsperthread %d tid %d aRowOff %d bColOff %d\n",$int:outputsPerThread,threadId,aRowOff,bColOff);
+                            
+                            // outRow start = (threadId * outputsPerThread) / $int:bColsPerTile
+                            // outRow end = ((threadId+1) * outputsPerThread) / $int:bColsPerTile
 
 
-                        // read private a
-                        // thread 0 0-7
-                        // thread 1 8-15
-                        // thread 2 0-7
-                        const int threadBColStart = threadId % $int:colsPerThread * $int:bColTileSize / $int:colsPerThread;
-                        
-                        // thread 0 row 0
-                        // thread 1 row 0
-                        // thread 2 row 1
-                        // thread 3 row 1
-                        const int threadARowStart = threadId / $int:colsPerThread;
 
-                        for (int n = 0; n < N; n += $int:aColTileSize){
-                        // read a
-                        // threadRow = threadId / aColTileSize
-                        // threadCol = threadId % aColTileSize
-                          const int rems = min(N-n,$int:aColTileSize);
+                            $ty:typ aRow[$int:aColsPerTile];
+                            // threads and columns should align on boundaries, so bunch of threads will need to load more data at the same time
+                            
+                            int currRow = -1;
+                            for (int i = 0; i < $int:outputsPerThread; i++){
+                              // output is a row, column combo
+                              // outRow = (threadId * outputsPerThread + i) / $int:bColsPerTile
+                              // outCol = (threadId * outputsPerThread + i) % $int:bColsPerTile
+                              // row of A
+                              // numCols is calculated per row
 
-                          localARows[threadId] = mx1[(get_group_id(0)*$int:aRowTileSize + threadId / $int:aColTileSize)*N+n+threadId % $int:aColTileSize];
+                              if (((startCol + i) / $int:bColsPerTile) + startRow + aRowOff < M && (((startCol+i) % $int:bColsPerTile) + bColOff) < K){
+                                if (((startCol + i) / $int:bColsPerTile) != currRow){
+                                  currRow = (startCol + i) / $int:bColsPerTile;
+                                    for (int r = 0; r < $int:aColsPerTile; r++){
+  /*
+                                      printf("localR (%d,%d) = localARows %d = %f\n"
+                                        ,currRow + startRow,r
+                                        ,(currRow + startRow) * $int:aColsPerTile + r
+                                        ,localARows[(currRow + startRow) * $int:aColsPerTile + r]
+                                      );
+  */
+                                      aRow[r] = localARows[(currRow + startRow) * $int:aColsPerTile + r];
+                                    } 
+                                }
 
-                        // copy b row swapping rows and columns
-                          localBRows[threadId] = mx2[(n + threadId % $int:aColTileSize)*K + get_group_id(1)*$int:bColTileSize + threadId / $int:aColTileSize];
-                          barrier(CLK_LOCAL_MEM_FENCE);
-
-                          $ty:typ aRow[$int:aColTileSize];
-                        
-                          for (int i = 0; i < rems; i++){
-                            aRow[i] = localARows[threadARowStart*$int:aColTileSize + i];
-                          } 
-                          for (int i = 0; i < $int:colsPerThread; i++){
-                            for (int j = 0; j < rems; j++){
-                              // j is the col of a but the row of b, however b is transposed
-                              results[i] += aRow[j] * localBRows[(threadBColStart + i)*$int:aColTileSize + j];
+                                // multiply aRow by column
+                                for (int c = 0; c < $int:aColsPerTile && (c+acol) < N; c++){
+  /*
+                                  printf("result[%d] += aRow[%d]:%f + localBCols(%d,%d):%f = %f"
+                                    ,i
+                                    ,c
+                                    ,aRow[c]
+                                    ,((startCol+i) % $int:bColsPerTile)
+                                    ,c
+                                    ,localBCols[((startCol+i) % $int:bColsPerTile)*$int:aColsPerTile + c]
+                                    , result[i] + aRow[c] * localBCols[((startCol+i) % $int:bColsPerTile)*$int:aColsPerTile + c]
+                                  
+                                  );
+  */
+                                  result[i] += aRow[c] * localBCols[((startCol+i) % $int:bColsPerTile)*$int:aColsPerTile + c];
+                                }
+                              }
+                            }
+                            barrier(CLK_LOCAL_MEM_FENCE);
+                          }
+                          // copy results to output
+                          // start row - aRowOff + ((threadId * $int:outputsPerThread + i) / $int:bColsPerTile);
+                          // start col - bColOff + ((threadId * $int:outputsPerThread + i) % $int:bColsPerTile);
+                          // TODO switch this to use variables startCol startRow etc
+                          // should always process in batches of columns
+                          for (int i = 0; i < $int:outputsPerThread; i++){
+                            if ((aRowOff + startRow + ((startCol + i) / $int:bColsPerTile)) < M && (bColOff + ((startCol + i) % $int:bColsPerTile)) < K){
+  /*
+                                printf("tid %d:%d:%d output (%d,%d) = %f\n"
+                                  , threadId, i, startCol+i
+                                  , (aRowOff+startRow+((startCol + i) / $int:bColsPerTile))
+                                  , ((startCol + i) % $int:bColsPerTile)
+                                  , result[i]
+                                );
+                                */
+                                output[(aRowOff+d*M+startRow+((startCol + i) / $int:bColsPerTile))*K+(bColOff + (startCol + i) % $int:bColsPerTile)] 
+                                  = result[i];                            
                             }
                           }
-                          barrier(CLK_LOCAL_MEM_FENCE);
                         }
-                        // write output from result
-                        // if threadARowStart + get_group_id(0)*$int:aRowTileSize < M && threadBColStart + get_group_id(1)*$int:bColTileSize < K
-                        const int r = min($int:colsPerThread,K - (threadBColStart + get_group_id(1)*$int:bColTileSize));
-                        for (int i = 0; i < r; i++){
-                          output[(get_group_id(0)*$int:aRowTileSize + threadARowStart)*K + get_group_id(1)*$int:bColTileSize + threadBColStart + i] = results[i];
-                        }
-                    }
-      |],
-        -- each work group computes a tilesize x tilesize output, but needs tilesize/2 workers
-        ( (fromIntegral (numATiles * aRowTileSize), fromIntegral aRowTileSize),
-          Just (fromIntegral numBTiles, 1),
-          Just (1, 1)
-        )
-      )
-
-
-denseT1C :: CLBlasType a => CLBlasState a -> Int -> Int -> Int ->  (Language.C.Syntax.Func, ((Word64, Word64), Maybe (Word64, Word64), Maybe (Word64, Word64)))
-denseT1C cls arows acols bcols =
-  
-  let typ = ctypes cls
-      bColTileSize = 32
-      aRowTileSize = 32
-      aColTileSize = 1
-      colsPerThread = bColTileSize `div` aRowTileSize
-      numATiles = arows `div` aRowTileSize + if arows `mod` aRowTileSize == 0 then 0 else 1
-      numBTiles = bcols `div` bColTileSize + if bcols `mod` bColTileSize == 0 then 0 else 1
-   in ( [cfun|kernel void denseT1C(int M, int N, int K,
-                      const global $ty:typ * mx1,
-                      const global $ty:typ * mx2,
-                      global $ty:typ* output
-                      ){
-                        const int threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
-                        local $ty:typ localBCols[$int:bColTileSize*$int:aColTileSize];
-                        local $ty:typ localARows[$int:aRowTileSize*$int:aColTileSize];
-                        $ty:typ results[$int:colsPerThread];
-                        for (int i = 0; i < $int:colsPerThread; i++){
-                          results[i] = 0;
-                        }
-
-
-                        // read private a
-                        // thread 0 0-7
-                        // thread 1 8-15
-                        // thread 2 0-7
-                        const int threadBColStart = threadId % $int:colsPerThread * $int:bColTileSize / $int:colsPerThread;
-                        
-                        // thread 0 row 0
-                        // thread 1 row 0
-                        // thread 2 row 1
-                        // thread 3 row 1
-                        const int threadARowStart = threadId / $int:colsPerThread;
-
-                        for (int n = 0; n < N; n += $int:aColTileSize){
-                        // read a
-                        // threadRow = threadId / aColTileSize
-                        // threadCol = threadId % aColTileSize
-                          const int rems = min(N-n,$int:aColTileSize);
-
-                          localARows[threadId] = mx1[(get_group_id(0)*$int:aRowTileSize + threadId / $int:aColTileSize)*N+n+threadId % $int:aColTileSize];
-
-                        // copy b row swapping rows and columns
-                          localBRows[threadId] = mx2[(n + threadId % $int:aColTileSize)*K + get_group_id(1)*$int:bColTileSize + threadId / $int:aColTileSize];
-                          barrier(CLK_LOCAL_MEM_FENCE);
-
-                          $ty:typ aRow[$int:aColTileSize];
-                        
-                          for (int i = 0; i < rems; i++){
-                            aRow[i] = localARows[threadARowStart*$int:aColTileSize + i];
-                          } 
-                          for (int i = 0; i < $int:colsPerThread; i++){
-                            for (int j = 0; j < rems; j++){
-                              // j is the col of a but the row of b, however b is transposed
-                              results[i] += aRow[j] * localBRows[(threadBColStart + i)*$int:aColTileSize + j];
-                            }
-                          }
-                          barrier(CLK_LOCAL_MEM_FENCE);
-                        }
-                        // write output from result
-                        // if threadARowStart + get_group_id(0)*$int:aRowTileSize < M && threadBColStart + get_group_id(1)*$int:bColTileSize < K
-                        const int r = min($int:colsPerThread,K - (threadBColStart + get_group_id(1)*$int:bColTileSize));
-                        for (int i = 0; i < r; i++){
-                          output[(get_group_id(0)*$int:aRowTileSize + threadARowStart)*K + get_group_id(1)*$int:bColTileSize + threadBColStart + i] = results[i];
-                        }
-                    }
-      |],
-        -- each work group computes a tilesize x tilesize output, but needs tilesize/2 workers
-        ( (fromIntegral (numATiles * aRowTileSize), fromIntegral aRowTileSize),
-          Just (fromIntegral numBTiles, 1),
-          Just (1, 1)
-        )
-      )
-denseT2C :: CLBlasType a => CLBlasState a -> Int -> Int -> Int ->  (Language.C.Syntax.Func, ((Word64, Word64), Maybe (Word64, Word64), Maybe (Word64, Word64)))
-denseT2C cls arows acols bcols =
-  
-  let typ = ctypes cls
-      bColTileSize = 32
-      aRowTileSize = 32
-      aColTileSize = 1
-      colsPerThread = bColTileSize `div` aRowTileSize
-      numATiles = arows `div` aRowTileSize + if arows `mod` aRowTileSize == 0 then 0 else 1
-      numBTiles = bcols `div` bColTileSize + if bcols `mod` bColTileSize == 0 then 0 else 1
-   in ( [cfun|kernel void denseT2C(int M, int N, int K,
-                      const global $ty:typ * mx1,
-                      const global $ty:typ * mx2,
-                      global $ty:typ* output
-                      ){
-                        const int threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
-                        local $ty:typ localBCols[$int:bColTileSize*$int:aColTileSize];
-                        local $ty:typ localARows[$int:aRowTileSize*$int:aColTileSize];
-                        $ty:typ results[$int:colsPerThread];
-                        for (int i = 0; i < $int:colsPerThread; i++){
-                          results[i] = 0;
-                        }
-
-
-                        // read private a
-                        // thread 0 0-7
-                        // thread 1 8-15
-                        // thread 2 0-7
-                        const int threadBColStart = threadId % $int:colsPerThread * $int:bColTileSize / $int:colsPerThread;
-                        
-                        // thread 0 row 0
-                        // thread 1 row 0
-                        // thread 2 row 1
-                        // thread 3 row 1
-                        const int threadARowStart = threadId / $int:colsPerThread;
-
-                        for (int n = 0; n < N; n += $int:aColTileSize){
-                        // read a
-                        // threadRow = threadId / aColTileSize
-                        // threadCol = threadId % aColTileSize
-                          const int rems = min(N-n,$int:aColTileSize);
-
-                          localARows[threadId] = mx1[(get_group_id(0)*$int:aRowTileSize + threadId / $int:aColTileSize)*N+n+threadId % $int:aColTileSize];
-
-                        // copy b row swapping rows and columns
-                          localBRows[threadId] = mx2[(n + threadId % $int:aColTileSize)*K + get_group_id(1)*$int:bColTileSize + threadId / $int:aColTileSize];
-                          barrier(CLK_LOCAL_MEM_FENCE);
-
-                          $ty:typ aRow[$int:aColTileSize];
-                        
-                          for (int i = 0; i < rems; i++){
-                            aRow[i] = localARows[threadARowStart*$int:aColTileSize + i];
-                          } 
-                          for (int i = 0; i < $int:colsPerThread; i++){
-                            for (int j = 0; j < rems; j++){
-                              // j is the col of a but the row of b, however b is transposed
-                              results[i] += aRow[j] * localBRows[(threadBColStart + i)*$int:aColTileSize + j];
-                            }
-                          }
-                          barrier(CLK_LOCAL_MEM_FENCE);
-                        }
-                        // write output from result
-                        // if threadARowStart + get_group_id(0)*$int:aRowTileSize < M && threadBColStart + get_group_id(1)*$int:bColTileSize < K
-                        const int r = min($int:colsPerThread,K - (threadBColStart + get_group_id(1)*$int:bColTileSize));
-                        for (int i = 0; i < r; i++){
-                          output[(get_group_id(0)*$int:aRowTileSize + threadARowStart)*K + get_group_id(1)*$int:bColTileSize + threadBColStart + i] = results[i];
-                        }
-                    }
-      |],
-        -- each work group computes a tilesize x tilesize output, but needs tilesize/2 workers
-        ( (fromIntegral (numATiles * aRowTileSize), fromIntegral aRowTileSize),
-          Just (fromIntegral numBTiles, 1),
-          Just (1, 1)
-        )
-      )
+                      }
+      |]

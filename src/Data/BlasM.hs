@@ -1,4 +1,3 @@
-
 {-# LANGUAGE BangPatterns #-}
 {-# LANGUAGE DataKinds #-}
 {-# LANGUAGE DeriveGeneric #-}
@@ -16,14 +15,14 @@
 module Data.BlasM where
 
 import Control.DeepSeq
-import Control.Monad.IO.Class (MonadIO,liftIO)
+import Control.Monad.IO.Class (MonadIO, liftIO)
+import Data.List (unfoldr)
 import Data.Proxy
 import Data.Serialize
 import Data.Vector.Serialize
+import qualified Data.Vector.Storable as V
 import GHC.Generics (Generic)
 import GHC.TypeLits
-import qualified Data.Vector.Storable as V
-import Data.List (unfoldr)
 
 data Matrix mx w h d where
   Matrix :: (KnownNat w, KnownNat h, KnownNat d) => mx -> Matrix mx w h d
@@ -121,29 +120,38 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
     Proxy h ->
     Proxy d ->
     m (Matrix mx w h d)
-    
-  mxToLists :: forall w h d.
+
+  mxToLists ::
+    forall w h d.
     (KnownNat w, KnownNat h, KnownNat d) =>
     Matrix mx w h d ->
     m [[[Double]]]
   mxToLists mx =
-    do v <- mxToVec mx
-       let layers = chunk v (w * h)
-       pure $ map (\l -> map V.toList (chunk l w)) layers
-    where chunk vec n = unfoldr (\v' ->
-                            if V.null v'
-                            then Nothing
-                            else let (v1,vr) = V.splitAt n v' in
-                                   Just (v1, vr)
-                         ) vec
-          w = (fromIntegral $ natVal (Proxy :: Proxy w)) :: Int
-          h = (fromIntegral $ natVal (Proxy :: Proxy h)) :: Int
+    do
+      v <- mxToVec mx
+      let layers = chunk v (w * h)
+      pure $ map (\l -> map V.toList (chunk l w)) layers
+    where
+      chunk vec n =
+        unfoldr
+          ( \v' ->
+              if V.null v'
+                then Nothing
+                else
+                  let (v1, vr) = V.splitAt n v'
+                   in Just (v1, vr)
+          )
+          vec
+      w = (fromIntegral $ natVal (Proxy :: Proxy w)) :: Int
+      h = (fromIntegral $ natVal (Proxy :: Proxy h)) :: Int
 
-  mxToVec :: (KnownNat w, KnownNat h, KnownNat d) =>
+  mxToVec ::
+    (KnownNat w, KnownNat h, KnownNat d) =>
     Matrix mx w h d ->
     m (V.Vector Double)
 
-  showFirst :: (KnownNat w, KnownNat h, KnownNat d) =>
+  showFirst ::
+    (KnownNat w, KnownNat h, KnownNat d) =>
     Matrix mx w h d ->
     m ()
   showFirst mx = do
@@ -155,7 +163,6 @@ class (MonadIO m, MonadFail m, Show mx) => BlasM m mx | m -> mx where
 
   addToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
   multToAllWithDepth :: (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> Matrix mx 1 1 d -> m (Matrix mx w h d)
-
 
   sumLayers :: forall w h d. (KnownNat w, KnownNat h, KnownNat d) => Matrix mx w h d -> m (Matrix mx 1 1 d)
 
@@ -371,7 +378,7 @@ serializeMx mx = do
     putInt64le (fromIntegral $ natVal (Proxy :: Proxy h))
     putInt64le (fromIntegral $ natVal (Proxy :: Proxy d))
     genericPutVector ls
-    
+
 maybeSerializeMx :: forall m mx w h d. (BlasM m mx, KnownNat w, KnownNat h, KnownNat d) => Maybe (Matrix mx w h d) -> m Put
 maybeSerializeMx Nothing = pure (putWord8 0)
 maybeSerializeMx (Just mx) = do

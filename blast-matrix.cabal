@@ -53,10 +53,11 @@ library
                        normaldistribution,
                        cereal,
                        deepseq,
-                       cereal-vector
+                       cereal-vector,
+                       time
 
   default-language:    Haskell2010
-  extra-libraries:     OpenCL
+  extra-libraries:     OpenCL 
 
 
 executable mnist_dcgan

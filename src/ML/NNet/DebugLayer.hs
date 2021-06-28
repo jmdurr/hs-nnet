@@ -25,18 +25,18 @@ debugSerialize _ =
 
 debugForward :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx) => DebugSt m -> Matrix mx w h d -> m (Matrix mx w h d, ())
 debugForward (DebugSt s True _ logAct) mx = do
-  -- csv <- mxToCSV mx
+  csv <- mxToCSV mx
   -- csv <- avgMxs [mx]
   -- when (csv > 10 || csv < -10) (logAct (pack $ s <> " forward: " <> show csv))
-  logAct (pack (s <> " forward"))
+  logAct (pack (s <> " forward\n" <> show csv))
   pure (mx, ())
 debugForward _ mx = pure (mx, ())
 
 debugBackward :: (KnownNat w, KnownNat h, KnownNat d, BlasM m mx) => DebugSt m -> () -> Matrix mx w h d -> m (Matrix mx w h d, ())
 debugBackward (DebugSt s _ True logAct) _ mx = do
-  -- csv <- avgMxs [mx]
+  csv <- avgMxs [mx]
   -- when (csv > 10 || csv < -10) (logAct (pack $ s <> " backward: " <> show csv))
-  logAct (pack (s <> " backward"))
+  logAct (pack (s <> " backward\n" <> show csv))
   pure (mx, ())
 debugBackward _ _ mx = pure (mx, ())
 

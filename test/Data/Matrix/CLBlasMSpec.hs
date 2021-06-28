@@ -30,7 +30,7 @@ spec = describe "check matrix operations" $ do
       l3 <- outer l1 l2
       mxToLists l3
     v `shouldBe` [[[6, 7, 8, 9, 1, 2, 3, 4, 5], [12, 14, 16, 18, 2, 4, 6, 8, 10], [18, 21, 24, 27, 3, 6, 9, 12, 15], [24, 28, 32, 36, 4, 8, 12, 16, 20], [30, 35, 40, 45, 5, 10, 15, 20, 25]]]
-  it "should perform a matrix multiplication" $ do
+  it "should perform dense smallmatrix multiplication" $ do
     v <- withCLGpu (undefined :: Proxy CFloat) $ do
       l1 <- mxFromList [1, 2, 3, 4, 5, 6] (undefined :: Proxy 3) (undefined :: Proxy 2) (undefined :: Proxy 1)
       l2 <- mxFromList [9, 8, 7] (undefined :: Proxy 1) (undefined :: Proxy 3) (undefined :: Proxy 1)
@@ -38,13 +38,21 @@ spec = describe "check matrix operations" $ do
       mxToLists l3
     v `shouldBe` [[[46], [118]]]
 
-  it "should perform a largematrix multiplication" $ do
+  it "should perform dense largematrix multiplication" $ do
     v <- withCLGpu (undefined :: Proxy CFloat) $ do
       l1 <- mxFromList largeMx1 (undefined :: Proxy 32) (undefined :: Proxy 18) (undefined :: Proxy 1)
       l2 <- mxFromList largeMx2 (undefined :: Proxy 12) (undefined :: Proxy 32) (undefined :: Proxy 1)
       l3 <- dense l1 l2
       mxToVec l3
     v `shouldBe` (V.fromList largeMxMultOut)
+
+  it "should perform dense largematrix multiplication with depth" $ do
+    v <- withCLGpu (undefined :: Proxy CFloat) $ do
+      l1 <- mxFromList (largeMx1 ++ largeMx1) (undefined :: Proxy 32) (undefined :: Proxy 18) (undefined :: Proxy 2)
+      l2 <- mxFromList (largeMx2 ++ largeMx2) (undefined :: Proxy 12) (undefined :: Proxy 32) (undefined :: Proxy 2)
+      l3 <- dense l1 l2
+      mxToVec l3
+    v `shouldBe` (V.fromList (largeMxMultOut ++ largeMxMultOut))
 
   it "should perform T1 matrix multiplication" $ do
     v <- withCLGpu (undefined :: Proxy CFloat) $ do
