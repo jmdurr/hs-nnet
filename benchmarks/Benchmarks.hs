@@ -61,21 +61,26 @@ main =
             (mx3, s1') <- genMatrix (Proxy :: Proxy '(32, 32, 32)) s1
             (mx4, s2) <- genMatrix (Proxy :: Proxy '(1024, 1024, 1)) s1'
             (mx5, s31) <- genMatrix (Proxy :: Proxy '(1, 1024, 1)) s2
-
             (mx6, s33) <- genMatrix (Proxy :: Proxy '(1024, 1, 1)) s31
-            s32 <- cacheAddLayer s33
+            (mx7, s34) <- genMatrix (Proxy :: Proxy '(1, 1024, 1)) s33
+            s32 <- cacheAddLayer s34
             (cin, cf, s3) <- genConvolveData s32
             (_, s4) <- execClGpu s3 $ void $ mult mx1 mx1
             (_, s5) <- execClGpu s4 $ void $ applyFunction mx2 func
             (_, s6) <- execClGpu s5 $ void $ multToAllWithDepth mx1 mx2
             (_, s7) <- execClGpu s6 $ void $ Data.BlasM.flip mx2 FlipBoth
             (_, s8) <- execClGpu s7 $ void $ sumLayers mx2
-            (_, s9) <- execClGpu s8 $ void $ dense mx4 mx5
-            (_, s10) <- execClGpu s9 $ void $ add mx4 mx4
-            pure ((mx1, mx2, mx3, mx4, mx5, mx6, cin, cf), s10)
+            (_, s91) <- execClGpu s8 $ void $ dense mx6 mx4
+            (_, s92) <- execClGpu s91 $ void $ dense mx4 mx4
+            (_, s93) <- execClGpu s92 $ void $ dense mx5 mx6
+            (_, s94) <- execClGpu s93 $ void $ denseT1 mx4 mx5
+            (_, s95) <- execClGpu s94 $ void $ denseT2 mx4 mx6
+            (_, s10) <- execClGpu s95 $ void $ add mx4 mx4
+            (_, s11) <- execClGpu s10 $ void $ outer mx7 mx5
+            pure ((mx1, mx2, mx3, mx4, mx5, mx6, mx7, cin, cf), s11)
         )
         (pure $ pure ())
-        ( \ ~((mx1, mx2, mx3, mx4, mx5, mx6, cin, cf), st) ->
+        ( \ ~((mx1, mx2, mx3, mx4, mx5, mx6, mx7, cin, cf), st) ->
             bgroup
               "main"
               [ bench "addLayer" $ nfIO $ execClGpu st $ addToAllWithDepth mx1 mx2,
@@ -89,7 +94,7 @@ main =
                 bench "dense1_1024x1024 * 1024x1024  " $ nfIO $ execClGpu st $ dense mx4 mx4,
                 bench "focus dense1_1024x1 * 1x1024" $ nfIO $ execClGpu st $ dense mx5 mx6,
                 bench "add" $ nfIO $ execClGpu st $ add mx4 mx4,
-                bench "outer" $ nfIO $ execClGpu st $ reshapeM mx5 >>= \mx5' -> outer mx5 mx5',
+                bench "outer" $ nfIO $ execClGpu st $ outer mx7 mx5,
                 bench "denseT1" $ nfIO $ execClGpu st $ denseT1 mx4 mx5,
                 bench "denseT2 realistic" $ nfIO $ execClGpu st $ denseT2 mx4 mx6
               ]

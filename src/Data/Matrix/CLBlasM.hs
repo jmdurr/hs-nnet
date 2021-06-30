@@ -182,7 +182,7 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
     clWaitForEvent e
     -- t' <- liftIO $ getCurrentTime
     -- liftIO $ putStrLn (formatTime defaultTimeLocale "end denset1 kern - %0Es"  (diffUTCTime t' t))
-    pure (Matrix (CLBlasMx memo w1 w2 d))
+    pure (Matrix (CLBlasMx memo w2 w1 d))
 
   denseT2 (Matrix (CLBlasMx mem1 w1 h1 d)) (Matrix (CLBlasMx mem2 _ h2 _)) = do
         -- liftIO $ printf "dense\n"
@@ -211,11 +211,12 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
     -- liftIO $ putStrLn "wait denset2 kern"
     clWaitForEvent e
     -- liftIO $ putStrLn "end denset2 kern"
-    pure (Matrix (CLBlasMx memo h1 h2 d))
+    pure (Matrix (CLBlasMx memo h2 h1 d))
 
 
   -- outer, multiply each element of mx1 with each element of mx2
-  outer mx1@(Matrix (CLBlasMx mem1 _ l1 _)) mx2@(Matrix (CLBlasMx mem2 _ l2 _)) = 
+  outer mx1@(Matrix (CLBlasMx mem1 _ l1 _)) mx2@(Matrix (CLBlasMx mem2 _ l2 _)) =
+    
     do
       -- liftIO $ printf "add\n"
       cls <- get
@@ -227,14 +228,13 @@ instance (MonadIO m, CLBlasType a, MonadFail m, Floating a, Storable a, Real a) 
           (prog, k') <- clKernelFromSource (clContext cls) (clDevices cls) code "outerC"
           put cls {clCompiledOuter = Just (prog, k')}
           pure k'
-
-      let tilesizeX = 8
-      let numtilesX = l1 `div` 8 + if l1 `mod` 8 > 0 then 1 else 0
-      let tilesizeY = 8
-      let numtilesY = l2 `div` 8 + if l2 `mod` 8 > 0 then 1 else 0
-      e <- clRunKernel (clCommandQueue cls) kern [CLAPlain (fromIntegral l1 :: CInt), CLAPlain (fromIntegral l2 :: CInt), CLAMem mem1, CLAMem mem2,  CLAMem memo] ((fromIntegral (numtilesX * tilesizeX), fromIntegral tilesizeX), Just (fromIntegral (numtilesY), fromIntegral 1), Nothing)
+      -- 64 work items in a wavefront
+      let numtilesX = l1
+      let numtilesY = l2 `div` 128 + if l2 `mod` 128 > 0 then 1 else 0
+      e <- clRunKernel (clCommandQueue cls) kern [CLAPlain (fromIntegral l1 :: CInt), CLAPlain (fromIntegral l2 :: CInt), CLAMem mem1, CLAMem mem2,  CLAMem memo] ((fromIntegral (numtilesX), fromIntegral 1), Just (fromIntegral (numtilesY*64), fromIntegral 64), Nothing)
       clWaitForEvent e
       pure (Matrix (CLBlasMx memo l2 l1 1))
+    
 
   scale mx amt = mx `applyFunction` Mul Value (Const amt)
 
@@ -1030,12 +1030,14 @@ data TileSize = TileSize {rowsLeft :: Int, colsRight :: Int, colsLeft :: Int, ti
 -- colsLeft * rowsLeft must be divisible by tileThreads
 -- rowsLeft * colsRight must be divisible by tileThreads
 denseTileSize :: Int -> Int -> Int -> TileSize
-denseTileSize _ _ _ = TileSize 8 8 4 32
-  -- | m == 1 && k == 1 = TileSize 16 16 1 32
-  -- | m == 1 = trace (printf "m %d n %d k %d" m n k) (TileSize 8 8 4 32)
-  -- | n > 3 = TileSize 8 8 4 32
-  -- | n > 1 = TileSize 16 16 2 32
-  -- | otherwise 
+denseTileSize m n k
+    | m == 1 && k == 1 = TileSize 16 16 1 32
+    | m == 1 && n > 2 = TileSize 1 4 4 4
+    | m == 1 && n > 1 = TileSize 1 4 4 4
+    | m == 1 = TileSize 1 4 4 4
+    | n > 3 = TileSize 16 16 4 64 --4 64 = 4ms, 8 128 - 6ms
+    | n > 1 = TileSize 16 16 2 32
+    | otherwise = TileSize 8 8 4 32 
   -- | m < 32 && n < 32 && k < 32 = TileSize 8 8 4
   -- | m == 1 = TileSize 1 32 4
 
@@ -1133,12 +1135,12 @@ denseC cls fname tilesize =
                                 );
   */
                                 localBCols[threadId * toRead + i] = 
-                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < M)) ?
+                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < K)) ?
                                     mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N * K))+((bColOff + (threadId * toRead + i) / $int:aColsPerTile)*N)] : 
                                     0;
                               } else {
                                 localBCols[threadId * toRead + i] = 
-                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < M)) ?
+                                  (((threadId * toRead + i) % $int:aColsPerTile + acol) < N && ((bColOff + (threadId * toRead + i) / $int:aColsPerTile) < K)) ?
 
                                     mx2[(((threadId * toRead + i) % $int:aColsPerTile + acol + d * N)*K)+(bColOff + (threadId * toRead + i) / $int:aColsPerTile)] :
                                     0;
@@ -1239,31 +1241,19 @@ outerC cls =
   let typ = ctypes cls
      
    in [cfun|kernel void outerC(int M, int N,
-                      const global $ty:typ * mx1,
+                      __constant const $ty:typ * mx1,
                       const global $ty:typ * mx2,
                       global $ty:typ* output
                       ){
-                        local $ty:typ localV[8];
-                        const int uoff = get_group_id(0)*8;
-                        const int voff = get_group_id(1)*8;
 
-                        const int threadId = get_local_id(0) * get_local_size(1) + get_local_id(1);
-                        
-                        // read 2 per thread
-                        $ty:typ uVal = 0;
-                        if (threadId + uoff < M){
-                          uVal = mx1[threadId+uoff];
-                        }
-                        if (threadId + voff < N){
-                          localV[threadId] = mx2[threadId+voff];
-                        }
-                        barrier(CLK_LOCAL_MEM_FENCE);
-                        if (threadId + uoff < M && voff < N){
-                          // multiply 8 per thread
-                          for (int i = 0; i < 8; i++){
-                            if (voff+i < N)
-                              output[(uoff+threadId)*N+voff+i] = uVal * localV[i];
-                          }
+                        if (get_group_id(0) < M){
+                          $ty:typ uval = mx1[get_group_id(0)];
+                          const int pos = get_group_id(1)*128 + get_local_id(1);
+                          if (pos < N)
+                            output[get_global_id(0)*N+get_local_id(1)] = uval * mx2[pos];
+                          if (pos + 64 < N)
+                            output[get_global_id(0)*N+get_local_id(1)+64] = uval * mx2[pos+64];
                         }
                       }
+
       |]

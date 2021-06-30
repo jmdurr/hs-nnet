@@ -70,8 +70,9 @@ discriminator =
     `connect` leakyRelu 0.2 (Proxy :: Proxy 1) (Proxy :: Proxy 256) (Proxy :: Proxy 1)
     `connect` dropout (mkStdGen 397212372) 0.3
     `connect` fullyConnectedSGD (Proxy :: Proxy 256) (Proxy :: Proxy 1)
-    --`connect` debugLayer "presigmoid" True True (liftIO . putStrLn . unpack)
     `connect` sigmoid (Proxy :: Proxy '(1, 1, 1))
+
+-- `connect` debugLayer "disc - postsigmoid" True True (liftIO . putStrLn . unpack)
 
 {-
   --debugLayer "back disc: " True True (liftIO . putStrLn . unpack)
@@ -102,6 +103,8 @@ generator =
     `connect` fullyConnectedSGD (Proxy :: Proxy 1024) (Proxy :: Proxy 784)
     `connect` reshape
     `connect` sigmoid (Proxy :: Proxy '(28, 28, 1))
+
+-- `connect` debugLayer "gen - postsigmoid" True True (liftIO . putStrLn . unpack)
 
 {-
   --debugLayer "before fc" True True (liftIO . putStrLn . unpack)
@@ -193,7 +196,7 @@ crossEntropyError output desired = do
   -- if desired is 1 then 1 - desired else desired
   -- sum (negative (a*log(p) + (1-a)*log(1-p))) / n
   vals <- mapM (\o -> V.head <$> mxToVec o) output
-  liftIO $ print vals
+  -- liftIO $ print vals
   let es = zipWith (\targ out -> (targ * (negate (log out)) + (1 - targ) * negate (log (1 - out)))) (map (\d -> if d then (1.0 - 1e-6) else 1e-6) desired) vals
   pure (sum es)
 
@@ -227,9 +230,8 @@ crossEntropyErrorDO output desired = do
 -}
 processEpoch :: (BlasM m mx, RandomGen g) => Int -> (Discriminator m mx a i gd gconf amod g, a) -> (Generator m mx ga gi ggd ggconf gmod g, ga) -> g -> [Matrix mx 28 28 1] -> V.Vector Double -> m (a, ga, g)
 processEpoch batchSize (disc, dst) (gen, gst) g allrs rands = do
-  let (ge, gi) = split g
   liftIO $ printf "--epoch--\n"
-  gr <- go (take batchSize allrs) (drop batchSize allrs) Nothing gi
+  (gr, g') <- go (take batchSize allrs) (drop batchSize allrs) Nothing g
   case gr of
     Nothing -> fail "no gradients from epoch"
     Just (dg, gg) -> do
@@ -238,9 +240,9 @@ processEpoch batchSize (disc, dst) (gen, gst) g allrs rands = do
       gst' <- runUpdate gen gst gg'
       dst' <- runUpdate disc dst dg'
       liftIO $ printf "--end epoch--\n"
-      pure (dst', gst', ge)
+      pure (dst', gst', g')
   where
-    go _ [] grads g0 = pure grads
+    go _ [] grads g0 = pure (grads, g0)
     go batch remains grads g0 = do
       let r = batch
 
@@ -300,16 +302,16 @@ main = do
     saveExImages mnist
     liftIO $ printf "loaded %d images\n" (length mnist)
     liftIO $ putStrLn "init discriminator"
-    (disc, dst, g) <- initNetwork g1 glorotUniformWeights discriminator (Rate 0.0002)
+    (disc, dst, g) <- initNetwork g1 glorotUniformWeights discriminator (Adam 0.0002 0.5 0.9999)
     liftIO $ putStrLn "init generator"
-    (gen, gst, g') <- initNetwork g glorotUniformWeights generator (Rate 0.0002)
+    (gen, gst, g') <- initNetwork g glorotUniformWeights generator (Adam 0.0002 0.5 0.9999)
     liftIO $ putStrLn "save initial generations"
     saveImages (0 :: Int) gen gst g' v
     liftIO $ putStrLn "start training"
     void $
       foldM
         ( \(dst', gst', ge, iter) perm -> do
-            (dste, gste, ge') <- processEpoch 60 (disc, dst') (gen, gst') ge perm v
+            (dste, gste, ge') <- processEpoch 100 (disc, dst') (gen, gst') ge perm v
             saveImages iter gen gste ge' v
             pure (dste, gste, ge', iter + 1)
         )

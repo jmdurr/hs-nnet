@@ -6,6 +6,7 @@
 module ML.NNet.DebugLayer where
 
 import Control.Monad (when)
+import Control.Monad.IO.Class (MonadIO (..))
 import Data.BlasM
 import Data.Proxy
 import Data.Serialize
@@ -40,8 +41,8 @@ debugBackward (DebugSt s _ True logAct) _ mx = do
   pure (mx, ())
 debugBackward _ _ mx = pure (mx, ())
 
-debugG :: Monad m => (() -> () -> m (), () -> Int -> m ())
-debugG = (const (const (pure ())), const (const (pure ())))
+debugG :: (Monad m, MonadIO m) => (() -> () -> m (), () -> Int -> m ())
+debugG = (const (const (liftIO (putStrLn "gradl") >> pure ())), const (const (liftIO (putStrLn "gradl") >> pure ())))
 
 debugU :: (Monad m) => conf -> DebugSt m -> () -> m (DebugSt m)
 debugU _ st@(DebugSt lbl _ _ act) _ = act (pack $ lbl <> ":update") >> pure st
